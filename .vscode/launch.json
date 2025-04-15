@@ -1,0 +1,13 @@
+{
+  "version": "0.2.0",
+  "configurations": [
+    {
+      "name": "C/C++ Runner: Debug Session",
+      "type": "lldb",
+      "request": "launch",
+      "args": [],
+      "cwd": "/Users/omerchernia/Studying/Year 3/AI_LAB/LAB1/AI_LAB_Genetic-Algorithms-Self-Organizing-Systems",
+      "program": "/Users/omerchernia/Studying/Year 3/AI_LAB/LAB1/AI_LAB_Genetic-Algorithms-Self-Organizing-Systems/build/Debug/outDebug"
+    }
+  ]
+}
