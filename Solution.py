@@ -15,8 +15,8 @@ GA_POPSIZE = 512    # Population size for the genetic algorithm
 GA_MAXITER = 16384    # Maximum number of generations (used in non-Bin Packing modes)
 # Stop if the global best fitness hasn’t improved for this many generations
 GA_NO_IMPROVEMENT_LIMIT = 300
-GA_ELITRATE = 0.2                # Elitism rate (percentage of best individuals preserved)
-GA_MUTATIONRATE = 0.4            # Mutation probability
+GA_ELITRATE = 0.1                # Elitism rate (percentage of best individuals preserved)
+GA_MUTATIONRATE = 0.5            # Mutation probability
 GA_TARGET = "Hello World!"        # Target string for the String evolution mode
 GA_CROSSOVER_OPERATOR = "SINGLE"  # Default crossover operator; may be updated based on user input
 
