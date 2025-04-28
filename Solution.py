@@ -8,10 +8,13 @@ import json
 import numpy as np
 import copy
 import sys
+from pathlib import Path  # needed for TSPLIB loader
 
 # Global GA parameters
 GA_POPSIZE = 512    # Population size for the genetic algorithm
 GA_MAXITER = 16384    # Maximum number of generations (used in non-Bin Packing modes)
+# Stop if the global best fitness hasn’t improved for this many generations
+GA_NO_IMPROVEMENT_LIMIT = 300
 GA_ELITRATE = 0.2                # Elitism rate (percentage of best individuals preserved)
 GA_MUTATIONRATE = 0.4            # Mutation probability
 GA_TARGET = "Hello World!"        # Target string for the String evolution mode
@@ -42,8 +45,93 @@ BP_OPTIMAL = None  # The theoretical optimal number of bins (provided in the fil
 # הוספת מצב DTSP
 DTSP_CITIES = []         # רשימת קואורדינטות ערים
 
-# הוספת מטמון גלובלי
 _DISTANCE_CACHE = {}
+
+# ───────────────────── VALIDATION HELPERS ───────────────────── #
+def is_hamiltonian_cycle(path) -> bool:
+    """
+    Return True iff `path` contains every city exactly once
+    and therefore forms a Hamiltonian cycle (closure is implicit
+    by wrapping from last➜first).
+    """
+    n = len(DTSP_CITIES)
+    return len(path) == n and len(set(path)) == n and set(path) == set(range(n))
+
+def tours_edge_overlap(path1, path2) -> bool:
+    """
+    Return True if the undirected edge‑sets of the two paths overlap.
+    Each edge is considered without orientation.
+    """
+    edges1 = {tuple(sorted((path1[i], path1[(i + 1) % len(path1)])))
+              for i in range(len(path1))}
+    edges2 = {tuple(sorted((path2[i], path2[(i + 1) % len(path2)])))
+              for i in range(len(path2))}
+    return not edges1.isdisjoint(edges2)
+
+def _dist(a: int, b: int) -> float:
+    """
+    Symmetric Euclidean distance between city indices a and b with memo‑cache.
+    """
+    key = (a, b) if a <= b else (b, a)
+    if key in _DISTANCE_CACHE:
+        return _DISTANCE_CACHE[key]
+    x1, y1 = DTSP_CITIES[key[0]]
+    x2, y2 = DTSP_CITIES[key[1]]
+    d = math.hypot(x2 - x1, y2 - y1)
+    _DISTANCE_CACHE[key] = d
+    return d
+
+# ───────────────────── VISUALIZATION (Step B) ───────────────────── #
+
+def plot_dtsp_paths(path_pair, title="DTSP – two disjoint tours"):
+    """
+    מצייר את שני המסלולים על גרף פיזור.
+    כחול – מסלול 1, כתום – מסלול 2.
+    """
+    if not DTSP_CITIES:
+        print("No cities loaded – cannot plot")
+        return
+    import matplotlib.pyplot as plt
+    path1, path2 = path_pair
+    xs = [c[0] for c in DTSP_CITIES]
+    ys = [c[1] for c in DTSP_CITIES]
+    plt.figure(figsize=(6, 6))
+
+    for path, style in [(path1, {"color": "tab:blue"}),
+                        (path2, {"color": "tab:orange"})]:
+        for i in range(len(path)):
+            a, b = path[i], path[(i + 1) % len(path)]
+            plt.plot([DTSP_CITIES[a][0], DTSP_CITIES[b][0]],
+                     [DTSP_CITIES[a][1], DTSP_CITIES[b][1]],
+                     **style, alpha=0.7)
+
+    plt.scatter(xs, ys, c="k", s=30, zorder=5)
+    for idx, (x, y) in enumerate(DTSP_CITIES):
+        plt.text(x, y, str(idx), fontsize=8, ha="right", va="bottom")
+    plt.title(title)
+    plt.axis("equal")
+    plt.tight_layout()
+    plt.show()
+
+
+# ───────────────────── 2-OPT LOCAL IMPROVEMENT (Step F) ─────────── #
+
+def two_opt(path):
+    """
+    Heuristic 2-opt: הופך קטעים שמקצרים את המסלול.
+    """
+    improved = True
+    n = len(path)
+    while improved:
+        improved = False
+        for i in range(n - 1):
+            for j in range(i + 2, n if i else n - 1):
+                a, b = path[i], path[(i + 1) % n]
+                c, d = path[j], path[(j + 1) % n]
+                if _dist(a, c) + _dist(b, d) < _dist(a, b) + _dist(c, d) - 1e-8:
+                    path[i + 1:j + 1] = reversed(path[i + 1:j + 1])
+                    improved = True
+    return path
 
 def lcs_length(s, t):
     """
@@ -161,29 +249,33 @@ class GAIndividual:
 
     def calculate_fitness_dtsp(self):
         path1, path2 = self.repr
+
+        # אורך כל מסלול
         total1 = self._path_distance(path1)
         total2 = self._path_distance(path2)
-        
-        edges1 = self._get_edges(path1)
-        edges2 = self._get_edges(path2)
-        
-        # מניעת קנסות שווא מקשתות כפולים באותו מסלול
-        common_edges = set(edges1).intersection(set(edges2))
-        unique_common = len(common_edges) - (len(edges1)+len(edges2)-len(set(edges1+edges2)))
-        
-        penalty = unique_common * 1e7  # קנס של 10 מיליון לחפיפה אמיתית
+
+        # בונה סט קשתות לא מכוּוָנות לכל מסלול
+        edges1 = {
+            tuple(sorted((path1[i], path1[(i + 1) % len(path1)])))
+            for i in range(len(path1))
+        }
+        edges2 = {
+            tuple(sorted((path2[i], path2[(i + 1) % len(path2)])))
+            for i in range(len(path2))
+        }
+
+        # קשתות משותפות לשני המסלולים (ללא כיוון)
+        common_edges = edges1 & edges2
+        penalty = len(common_edges) * 10_000_000  # 10 מיל׳ לכל חפיפה
+
+        # כושר = אורך המסלול הארוך + קנס
         self.fitness = max(total1, total2) + penalty
 
     def _path_distance(self, path):
-        total = 0
-        n = len(DTSP_CITIES)
+        total = 0.0
+        n = len(path)
         for i in range(n):
-            city_a = path[i]
-            city_b = path[(i+1)%n]
-            # וידוא שהקואורדינטות נקראות נכון
-            x1, y1 = DTSP_CITIES[city_a][0], DTSP_CITIES[city_a][1]  
-            x2, y2 = DTSP_CITIES[city_b][0], DTSP_CITIES[city_b][1]
-            total += math.hypot(x2-x1, y2-y1)
+            total += _dist(path[i], path[(i + 1) % n])
         return total
 
     def _get_edges(self, path):
@@ -231,18 +323,44 @@ class GAIndividual:
         self.repair_dtsp()  # הוספת תיקון אוטומטי לאחר מוטציה
 
     def repair_dtsp(self):
-        """גרסה מתוקנת עם טיפול בגבולות המערך"""
+        """
+        Break edge overlaps between the two tours using 2‑opt style segment reversals.
+        """
         path1, path2 = self.repr
         edges1 = self._get_edges(path1)
         edges2 = self._get_edges(path2)
-        
+
         common_edges = set(edges1).intersection(edges2)
-        for edge in common_edges:
-            # הוספת מנגנון היפוך קטעים גדולים יותר
+        for (a, b) in list(common_edges):
+            # helper: find index of edge (x,y) or (y,x) in path
+            def edge_index(p, x, y):
+                try:
+                    i = p.index(x)
+                    if p[(i + 1) % len(p)] == y:
+                        return i
+                    i = p.index(y)
+                    if p[(i + 1) % len(p)] == x:
+                        return i
+                except ValueError:
+                    return None
+                return None
+            idx1 = edge_index(path1, a, b)
+            idx2 = edge_index(path2, a, b)
+            if idx1 is None or idx2 is None:
+                continue
+            # choose which path to modify
             if random.random() < 0.5:
-                start = random.randint(0, len(path1)-2)
-                end = random.randint(start+1, len(path1)-1)
-                path1[start:end+1] = path1[start:end+1][::-1]
+                i, j = sorted((idx1, (idx1 + 1) % len(path1)))
+                path1[i:j + 1] = reversed(path1[i:j + 1])
+            else:
+                i, j = sorted((idx2, (idx2 + 1) % len(path2)))
+                path2[i:j + 1] = reversed(path2[i:j + 1])
+    
+    def local_optimize_dtsp(self):
+        """Apply 2-opt independently to both tours (Step F)."""
+        p1, p2 = self.repr
+        two_opt(p1)
+        two_opt(p2)
 
 def init_population():
     """Initialize and return a list of GAIndividual objects forming the initial population."""
@@ -433,7 +551,7 @@ def compute_diversity_metrics(population):
             total_hamming += avg_diff
             total_distinct += len(freq)
             total_entropy += pos_entropy
-        avg_hamming_distance = total_hamming * L
+        avg_hamming_distance = total_hamming
         avg_distinct = total_distinct / L
         avg_entropy = total_entropy / L
         return avg_hamming_distance, avg_distinct, avg_entropy
@@ -463,7 +581,7 @@ def compute_diversity_metrics(population):
         return (0, 0, 0)
 
 # ---------- Task 1: Generation Stats, Task 8 & Task 9 Combined ----------
-def print_generation_stats(population, generation, tick_duration, total_elapsed):
+def print_generation_stats(population, generation, tick_duration, total_elapsed, best_ever_fitness=None):
     """
     Print detailed stats for the current generation, including fitness distribution and selection metrics.
     """
@@ -482,6 +600,8 @@ def print_generation_stats(population, generation, tick_duration, total_elapsed)
     print(f"  Std Dev = {std_dev:.2f}")
     print(f"  Worst Fitness = {worst.fitness}")
     print(f"  Fitness Range = {fitness_range}")
+    if best_ever_fitness is not None:
+        print(f"  Best‑Ever Fitness      = {best_ever_fitness}")
     print(f"  Tick Duration (sec) = {tick_duration:.4f}")
     print(f"  Total Elapsed Time (sec) = {total_elapsed:.4f}")
     adjusted = [worst.fitness - ind.fitness for ind in population]
@@ -607,25 +727,194 @@ def print_bin_details(bins, total_runtime):
         total = sum(sizes)
         print(f"Bin {idx}: {sizes}  (Total: {total}/{BP_CAPACITY})")
 
-def load_dtsp_data(cities_path):
-    """טוען ערים ללא מטריצת מרחקים"""
-    import csv
-    global DTSP_CITIES
+def load_dtsp_data(cities_path: str):
+    """
+    Load coordinates from either a CSV file (id,x,y,…) or a TSPLIB *.tsp file.
+    Populates DTSP_CITIES and clears the distance cache.
+    """
+    global DTSP_CITIES, _DISTANCE_CACHE
     DTSP_CITIES = []
-    print("\nLoading cities data...")
-    with open(cities_path) as f:
-        reader = csv.reader(f)
-        next(reader)  # Skip header
-        for row in reader:
-            try:
-                x = float(row[1])
-                y = float(row[2])
-                DTSP_CITIES.append((x, y))
-            except (IndexError, ValueError) as e:
-                print(f"Error parsing row {row}: {e}")
-    print(f"Successfully loaded {len(DTSP_CITIES)} cities")
-    if len(DTSP_CITIES) < 2:
-        raise ValueError("At least 2 cities required for DTSP")
+    _DISTANCE_CACHE.clear()
+
+    ext = Path(cities_path).suffix.lower()
+    if ext == ".csv":
+        import csv
+        with open(cities_path, newline="") as f:
+            reader = csv.reader(f)
+            header = next(reader, None)  # skip optional header
+            for row in reader:
+                try:
+                    DTSP_CITIES.append((float(row[1]), float(row[2])))
+                except (IndexError, ValueError):
+                    continue
+    else:  # assume TSPLIB format
+        with open(cities_path, "r") as f:
+            lines = [ln.strip() for ln in f if ln.strip()]
+        try:
+            start = lines.index("NODE_COORD_SECTION") + 1
+        except ValueError:
+            raise ValueError("TSPLIB file missing NODE_COORD_SECTION")
+        for ln in lines[start:]:
+            if ln.upper().startswith("EOF"):
+                break
+            parts = ln.split()
+            if len(parts) >= 3:
+                _, x, y = parts[:3]
+                DTSP_CITIES.append((float(x), float(y)))
+
+    if len(DTSP_CITIES) < 3:
+        raise ValueError(f"Failed to load coordinates from {cities_path}")
+    print(f"Loaded {len(DTSP_CITIES)} cities from {Path(cities_path).name}")
+
+
+# ───────────────────── DTSP FULL 10‑STEP PIPELINE ───────────────────── #
+
+def run_dtsp(cities_path: str):
+    """
+    End‑to‑end pipeline implementing the 10 steps (A–J) for solving the
+    Disjoint‑TSP (DTSP).  Each major stage is marked so that the execution
+    trace is easy to follow and debug.
+
+        A) Load coordinates                         – already performed upstream
+        B) Visualise random initial tours           (optional)
+        C) Initialise GA population
+        D) Evaluate fitness of initial population
+        E) Evolutionary loop with logging
+        F) Periodic 2‑opt local optimisation
+        G) Stagnation detection + triggered hyper‑mutation
+        H) Plot convergence curves
+        I) Visualise best pair of tours
+        J) Persist best solution to <cities>.best.json
+    """
+    # --- user‑tunable patience: stop after this many generations w/o progress
+    EARLY_STOP_PATIENCE = 50        # ← was effectively 300 before
+    global GA_MODE, GA_CROSSOVER_OPERATOR, GA_FITNESS_HEURISTIC
+
+    # ---------- Step B: draw a random initial pair of tours -------------
+    if len(DTSP_CITIES) >= 3:
+        sample_ind = GAIndividual()
+        plot_dtsp_paths(sample_ind.repr, title="Step B – random initial tours")
+
+    # ---------- Step C: GA initialisation -------------------------------
+    GA_CROSSOVER_OPERATOR = "DTSP"
+    GA_FITNESS_HEURISTIC  = "DTSP"
+    population = init_population()
+    buffer     = []
+
+    best_ever_fitness    = float("inf")
+    best_ever_individual = None
+    no_improve_count     = 0
+    fitness_history      = []
+    avg_history          = []
+    worst_history        = []
+    distribution_log     = []
+
+    start_time = timeit.default_timer()
+
+    # ---------- Step D: initial evaluation ------------------------------
+    for ind in population:
+        ind.calculate_fitness_dtsp()
+    sort_population(population)
+
+    # ---------- Step E + F + G: evolutionary loop -----------------------
+    for generation in range(GA_MAXITER):
+        # Step F – local 2‑opt every 50 generations
+        if generation and generation % 50 == 0:
+            for ind in population:
+                ind.local_optimize_dtsp()
+
+        # Re‑evaluate & sort
+        for ind in population:
+            ind.calculate_fitness_dtsp()
+        sort_population(population)
+
+        best   = population[0]
+        worst  = population[-1]
+        avg    = sum(ind.fitness for ind in population) / len(population)
+        fitness_history.append(best.fitness)
+        avg_history.append(avg)
+        worst_history.append(worst.fitness)
+        distribution_log.append([ind.fitness for ind in population])
+
+        # Step G – global‑best tracking & stagnation counter
+        if best.fitness < best_ever_fitness - 1e-9:
+            best_ever_fitness    = best.fitness
+            best_ever_individual = copy.deepcopy(best)
+            no_improve_count     = 0
+        else:
+            no_improve_count += 1
+
+        print(f"Gen {generation:5d} | best {best_ever_fitness:,.2f} | "
+              f"avg {avg:,.2f} | worst {worst.fitness:,.2f} | "
+              f'Δ={no_improve_count}')
+
+        # Triggered hyper‑mutation on stagnation every 100 generations
+        if no_improve_count and no_improve_count % 100 == 0:
+            print('🧬  Hyper‑mutation triggered!')
+            for ind in population[int(0.5 * GA_POPSIZE):]:
+                ind.mutate_dtsp()   # high‑intensity mutation
+
+        if no_improve_count >= EARLY_STOP_PATIENCE:
+            print(f"⏹  Early‑stop: no improvement for {EARLY_STOP_PATIENCE} generations")
+            break
+
+        # Mate & create next generation
+        buffer.clear()
+        mate(population, buffer)
+        population, buffer = buffer, population
+        population = apply_aging(population)
+
+    # ---------- Step H: convergence plots -------------------------------
+    try:
+        import matplotlib.pyplot as plt
+        plt.figure(figsize=(10, 6))
+        plt.plot(fitness_history, label="best")
+        plt.plot(avg_history, label="avg")
+        plt.plot(worst_history, label="worst")
+        plt.xlabel("generation"); plt.ylabel("fitness")
+        plt.title("DTSP convergence"); plt.legend(); plt.grid(True)
+        plt.tight_layout(); plt.show()
+    except Exception as e:
+        print(f"Plotting failed: {e}")
+
+    # ---------- Step I: visualise best paths ----------------------------
+    # ===== Print best tours & their lengths for easy inspection =====
+    if best_ever_individual is not None:
+        def _path_len(path):
+            return sum(_dist(path[i], path[(i + 1) % len(path)])
+                       for i in range(len(path)))
+
+        tour1, tour2 = best_ever_individual.repr
+        valid1 = is_hamiltonian_cycle(tour1)
+        valid2 = is_hamiltonian_cycle(tour2)
+        overlap = tours_edge_overlap(tour1, tour2)
+
+        print("\n──────────  BEST DTSP SOLUTION  ──────────")
+        print(f"Fitness (max tour length): {best_ever_fitness:,.2f}")
+        print(f"Tour 1 length: {_path_len(tour1):,.2f}  |  Valid cycle: {valid1}")
+        print(f"Tour 1 order (closed): {tour1 + [tour1[0]]}")
+        print(f"Tour 2 length: {_path_len(tour2):,.2f}  |  Valid cycle: {valid2}")
+        print(f"Tour 2 order (closed): {tour2 + [tour2[0]]}")
+        print(f"Edge overlap between tours: {overlap}")
+        print("──────────────────────────────────────────\n")
+
+        if not (valid1 and valid2) or overlap:
+            print("⚠️  Warning: final solution violates DTSP constraints "
+                  "(non‑Hamiltonian cycle or edge overlap). "
+                  "Consider increasing evolution time or enabling repair heuristics.")
+        plot_dtsp_paths(best_ever_individual.repr,
+                        title=f"Step I – best fitness {best_ever_fitness:,.2f}")
+
+    # ---------- Step J: persist solution --------------------------------
+    out_path = Path(cities_path).with_suffix(".best.json")
+    try:
+        with open(out_path, "w") as f:
+            json.dump({"fitness": best_ever_fitness,
+                       "path1": best_ever_individual.repr[0],
+                       "path2": best_ever_individual.repr[1]}, f, indent=2)
+        print(f"💾  Saved best solution to {out_path.name}")
+    except Exception as e:
+        print(f"Could not save best solution: {e}")
 
 def main():
     global GA_MODE, GA_ARC_TARGET_GRID, GA_ARC_INPUT_GRID, bp_instance
@@ -712,29 +1001,34 @@ def main():
                 buffer = []
                 best_solution = None
                 best_fitness_list = []
+                # --- Early-stopping trackers ---
+                best_ever_fitness = float("inf")
+                no_improve_count  = 0
                 start_time = timeit.default_timer()
-                consecutive_ones = 0  # Count consecutive generations with best fitness equal to 1
+                #consecutive_ones = 0  # Count consecutive generations with best fitness equal to 1
                 for generation in range(50):
                     tick_start = timeit.default_timer()
                     for ind in population:
                         ind.calculate_fitness_binpacking()
                     sort_population(population)
                     best_fitness = population[0].fitness
-                    best_fitness_list.append(best_fitness)
+                    # ── global‑best bookkeeping & patience counter ─────────────────────
+                    if best_fitness < best_ever_fitness:
+                        best_ever_fitness = best_fitness
+                        best_solution     = population[0].repr
+                        no_improve_count  = 0
+                    else:
+                        no_improve_count += 1
+                        best_fitness      = best_ever_fitness   # keep log monotonic
+                    best_fitness_list.append(best_ever_fitness)
                     tick_end = timeit.default_timer()
                     tick_duration = tick_end - tick_start
                     total_elapsed = tick_end - start_time
                     print(f"Problem {bp_instance['name']} Gen {generation}: Best fitness = {best_fitness} (Tick: {tick_duration:.4f}s, Total: {total_elapsed:.4f}s)")
-                    
-                    # Check if best fitness is 1 for 5 consecutive generations
-                    if best_fitness == 1:
-                        consecutive_ones += 1
-                    else:
-                        consecutive_ones = 0
-                    if consecutive_ones >= 5:
-                        print(f"5 consecutive generations with fitness 1 reached at generation {generation}.")
+                    # Early stopping if no improvement
+                    if no_improve_count >= GA_NO_IMPROVEMENT_LIMIT:
+                        print(f"No improvement for {GA_NO_IMPROVEMENT_LIMIT} generations – stopping early.")
                         break
-                    
                     buffer = []
                     esize = int(GA_POPSIZE * GA_ELITRATE)
                     elitism(population, buffer, esize)
@@ -749,7 +1043,7 @@ def main():
                     population = buffer
                     population = apply_aging(population)
                 # End of GA run for the current problem; use the best solution from the final population
-                best_solution = population[0].repr
+                #best_solution = population[0].repr
                 final_bins = []
                 # Compute final bin distribution using First-Fit
                 for i in best_solution:
@@ -784,74 +1078,8 @@ def main():
         GA_MODE = "DTSP"
         cities_path = input("Enter path to cities.csv: ").strip()
         load_dtsp_data(cities_path)
-        GA_CROSSOVER_OPERATOR = "DTSP"
-        GA_FITNESS_HEURISTIC = "DTSP"
-        
-        # אתחול האוכלוסיה והלולאה הגנטית
-        random.seed(time.time())
-        start_time = timeit.default_timer()
-        population = init_population()
-        buffer = []
-        best_fitness_list = []
-        avg_fitness_list = []
-        worst_fitness_list = []
-        fitness_distributions = []
-        generation = 0
-        best_solution = None
-        
-        while generation < GA_MAXITER:
-            tick_start = timeit.default_timer()
-            for ind in population:
-                ind.calculate_fitness_dtsp()
-            sort_population(population)
-            fitness_values = [ind.fitness for ind in population]
-            fitness_distributions.append(fitness_values.copy())
-            best_fitness = population[0].fitness
-            worst_fitness = population[-1].fitness
-            avg_fitness = sum(ind.fitness for ind in population) / len(population)
-            best_fitness_list.append(best_fitness)
-            avg_fitness_list.append(avg_fitness)
-            worst_fitness_list.append(worst_fitness)
-            tick_end = timeit.default_timer()
-            tick_duration = tick_end - tick_start
-            total_elapsed = tick_end - start_time
-            print_generation_stats(population, generation, tick_duration, total_elapsed)
-            if population[0].fitness == 0:
-                best_solution = population[0].repr
-                print(f"\n*** Converged after {generation + 1} generations ***")
-                break
-            buffer.clear()
-            mate(population, buffer)
-            population, buffer = buffer, population
-            population = apply_aging(population)
-            generation += 1
-        if best_solution is None and GA_MODE == "ARC":
-            print("\n*** Final Best Attempt ***")
-            plot_grids(np.array(GA_ARC_INPUT_GRID), np.array(GA_ARC_TARGET_GRID), np.array(population[0].repr))
-            print(f"Matching Cells: {len(GA_ARC_INPUT_GRID)*len(GA_ARC_INPUT_GRID[0]) - population[0].fitness}/{len(GA_ARC_INPUT_GRID)*len(GA_ARC_INPUT_GRID[0])}")
-        elif GA_MODE == "ARC":
-            solution_np = np.array(best_solution) if best_solution else None
-            plot_grids(np.array(GA_ARC_INPUT_GRID), np.array(GA_ARC_TARGET_GRID), solution_np)
-            if best_solution is None:
-                print(f"\nMatching Cells: {len(GA_ARC_INPUT_GRID)*len(GA_ARC_INPUT_GRID[0]) - population[0].fitness}/{len(GA_ARC_INPUT_GRID)*len(GA_ARC_INPUT_GRID[0])}")
-        plt.figure(figsize=(10, 6))
-        generations = list(range(len(best_fitness_list)))
-        plt.plot(generations, best_fitness_list, label="Best Fitness")
-        plt.plot(generations, avg_fitness_list, label="Average Fitness")
-        plt.plot(generations, worst_fitness_list, label="Worst Fitness")
-        plt.xlabel("Generation")
-        plt.ylabel("Fitness")
-        plt.title("Fitness Behavior per Generation")
-        plt.legend()
-        plt.grid(True)
-        plt.show()
-        plt.figure(figsize=(12, 6))
-        plt.boxplot(fitness_distributions, showfliers=True)
-        plt.xlabel("Generation")
-        plt.ylabel("Fitness")
-        plt.title("Box Plot of Fitness per Generation")
-        plt.grid(True)
-        plt.show()
+        run_dtsp(cities_path)
+        return   # DTSP pipeline finished
         # ---------- Task 5: Exploration vs. Exploitation Explanation ----------
         # The algorithm balances exploration and exploitation as follows:
         # • Exploration: Random initialization, mutation, and varied crossover operators introduce diversity
@@ -939,7 +1167,16 @@ def main():
     fitness_distributions = []
     generation = 0
     best_solution = None
-    
+    # --- Early-stopping trackers ---
+    best_ever_fitness = float("inf")
+    no_improve_count  = 0
+    # --- Monotone best-so-far tracking ---
+    monotone_best_history = []
+    global_best_fitness = None
+    global_best_individual = None
+    # --- global best‑so‑far bookkeeping (monotone decrease expected) ---
+    best_ever = None                 # stores the chromosome / path pair
+    best_ever_fitness = float('inf') # minimization: lower is better
     while generation < GA_MAXITER:
         tick_start = timeit.default_timer()
         for ind in population:
@@ -952,22 +1189,50 @@ def main():
         sort_population(population)
         fitness_values = [ind.fitness for ind in population]
         fitness_distributions.append(fitness_values.copy())
-        best_fitness = population[0].fitness
+        best = population[0]
+        best_fitness = best.fitness
+        best_index = 0
         worst_fitness = population[-1].fitness
         avg_fitness = sum(ind.fitness for ind in population) / len(population)
-        best_fitness_list.append(best_fitness)
+        # update global best‑so‑far if this generation improved it
+        if best_fitness < best_ever_fitness:
+            best_ever_fitness = best_fitness
+            best_ever = copy.deepcopy(best)
+        # --- Track global best so far (monotone) ---
+        if generation == 0:
+            global_best_fitness = best_fitness   # first generation best
+            global_best_individual = copy.deepcopy(population[best_index])
+        else:
+            if best_fitness < global_best_fitness:
+                global_best_fitness = best_fitness
+                global_best_individual = copy.deepcopy(population[best_index])
+        # Store the monotone series for plotting
+        monotone_best_history.append(global_best_fitness)
+        # ── global‑best bookkeeping & patience counter ─────────────────────
+        if best_fitness < best_ever_fitness:
+            best_solution     = population[0].repr
+            no_improve_count  = 0
+        else:
+            no_improve_count += 1
+            best_fitness      = best_ever_fitness   # keep log monotonic
+        best_fitness_list.append(best_ever_fitness)
         avg_fitness_list.append(avg_fitness)
         worst_fitness_list.append(worst_fitness)
         tick_end = timeit.default_timer()
         tick_duration = tick_end - tick_start
         total_elapsed = tick_end - start_time
-        print_generation_stats(population, generation, tick_duration, total_elapsed)
+        print(f"Gen {generation}: Best‑so‑far = {best_ever.repr if hasattr(best_ever, 'repr') else best_ever} (Fitness = {best_ever_fitness})")
         if population[0].fitness == 0:
             best_solution = population[0].repr
             print(f"\n*** Converged after {generation + 1} generations ***")
             break
+        if no_improve_count >= GA_NO_IMPROVEMENT_LIMIT:
+            print(f"No improvement for {GA_NO_IMPROVEMENT_LIMIT} generations – stopping early.")
+            break
         buffer.clear()
         mate(population, buffer)
+        # --- Elitism: ensure the best-so-far survives ---
+        population[random.randrange(len(population))] = copy.deepcopy(global_best_individual)
         population, buffer = buffer, population
         population = apply_aging(population)
         generation += 1
@@ -981,10 +1246,8 @@ def main():
         if best_solution is None:
             print(f"\nMatching Cells: {len(GA_ARC_INPUT_GRID)*len(GA_ARC_INPUT_GRID[0]) - population[0].fitness}/{len(GA_ARC_INPUT_GRID)*len(GA_ARC_INPUT_GRID[0])}")
     plt.figure(figsize=(10, 6))
-    generations = list(range(len(best_fitness_list)))
-    plt.plot(generations, best_fitness_list, label="Best Fitness")
-    plt.plot(generations, avg_fitness_list, label="Average Fitness")
-    plt.plot(generations, worst_fitness_list, label="Worst Fitness")
+    generations = list(range(len(monotone_best_history)))
+    plt.plot(generations, monotone_best_history, label="Best‑so‑far")
     plt.xlabel("Generation")
     plt.ylabel("Fitness")
     plt.title("Fitness Behavior per Generation")
