@@ -16,23 +16,32 @@ GA_MAXITER = 16384    # Maximum number of generations (used in non-Bin Packing m
 # Stop if the global best fitness hasn’t improved for this many generations
 GA_NO_IMPROVEMENT_LIMIT = 300
 GA_ELITRATE = 0.1                # Elitism rate (percentage of best individuals preserved)
-GA_MUTATIONRATE = 0.9            # Mutation probability
+GA_MUTATIONRATE = 0.25            # Mutation probability
 
 # ───── Mutation–control policies (Task 2‑a) ────────────────────────── #
-GA_MUTATION_POLICY  = "LOGISTIC"   # "CONSTANT", "LOGISTIC", "THM"
+GA_MUTATION_POLICY  = "THM"   # "CONSTANT", "LOGISTIC", "THM"
 # LOGISTIC‑decay parameters
 GA_MUTRATE_MAX      = 0.9
 GA_MUTRATE_MIN      = 0.05
-GA_DECAY_RATE       = 0.03         # decay coefficient r
+GA_DECAY_RATE       = 0.05         # decay coefficient r
 # Triggered‑Hyper‑Mutation (THM) parameters
-GA_MUTRATE_BASE     = 0.10
-GA_MUTRATE_HYPER    = 0.70
-GA_THM_PATIENCE     = 30           # gens without improvement ⇒ burst
-GA_THM_DURATION     = 5            # gens to keep hyper‑µ active
+GA_MUTRATE_BASE     = 0.25
+GA_MUTRATE_HYPER    = 0.75
+GA_THM_PATIENCE     = 25           # gens without improvement ⇒ burst
+GA_THM_DURATION     = 20            # gens to keep hyper‑µ active
 # runtime variables (updated each generation)
 GA_DYNAMIC_MUTRATE  = GA_MUTATIONRATE   # effective µ for the current gen
 _THM_BURST_REMAINING = 0
+# --- logging helper: average individual‑level mutation probability ---
+GEN_AVG_INDIV_MUT_HISTORY: list[float] = []
 # ───────────────────────────────────────────────────────────────────── #
+
+# ───── Individual‑level adaptive mutation (Task 2‑b) ───── #
+# Options: "NONE" (default), "FITNESS" (relative fitness), "AGE" (age‑based)
+GA_INDIV_MUT_POLICY = "FITNESS"
+_INDIV_MUT_MIN      = GA_MUTRATE_MIN
+_INDIV_MUT_MAX      = GA_MUTRATE_MAX
+# --------------------------------------------------------- #
 
 GA_TARGET = "Hello World!"        # Target string for the String evolution mode
 GA_CROSSOVER_OPERATOR = "SINGLE"  # Default crossover operator; may be updated based on user input
@@ -46,7 +55,7 @@ GA_BONUS_FACTOR = 0.5              # Bonus factor for correct positions in LCS-b
 GA_PARENT_SELECTION_METHOD = "RWS"  # Default parent selection method (can be updated by user)
 GA_TOURNAMENT_K = 5                # Tournament size for tournament-based selection
 GA_TOURNAMENT_P = 0.8              # Probability of selecting the best in a stochastic tournament
-GA_MAX_AGE = 10                    # Maximum age for an individual (for aging survivor selection)
+GA_MAX_AGE = 20                    # Maximum age for an individual (for aging survivor selection)
 
 # Global mode variables; these change the problem being solved.
 # Options: "STRING" (for Hello World evolution), "ARC" (for ARC puzzles), or "BINPACKING" (for bin packing problems)
@@ -119,7 +128,36 @@ def compute_mutation_rate(generation: int, stagnation_counter: int) -> float:
         return GA_MUTRATE_BASE
     else:  # CONSTANT
         return GA_MUTATIONRATE
-# ───────────────────────────────────────────────────────────────────── #
+
+# ───────── per‑individual adaptive mutation probability ───────── #
+def compute_individual_mutrate(parent1, parent2, avg_fit):
+    """
+    Derive offspring mutation probability according to GA_INDIV_MUT_POLICY,
+    **combined multiplicatively** with the *global* population‑level rate
+    GA_DYNAMIC_MUTRATE so that both schedulers operate together.
+
+    • "NONE"    : μ_i = GA_DYNAMIC_MUTRATE          (population wide only)
+    • "FITNESS" : μ_i = μ_global · (1 – relative_fitness)
+    • "AGE"     : μ_i = μ_global · age_norm
+                 where age_norm = max(parent.age)/GA_MAX_AGE  in [0,1]
+    The returned value is finally clamped to [_INDIV_MUT_MIN, _INDIV_MUT_MAX].
+    """
+    # always start from global scheduler value
+    base_mu = GA_DYNAMIC_MUTRATE
+
+    if GA_INDIV_MUT_POLICY == "FITNESS" and avg_fit > 0:
+        rel_fit = ((parent1.fitness + parent2.fitness) / 2) / avg_fit   # ∈ ℝ⁺
+        prob = base_mu * (1.0 - rel_fit)                                # worse → higher μ
+    elif GA_INDIV_MUT_POLICY == "AGE":
+        age_norm = max(parent1.age, parent2.age) / float(max(1, GA_MAX_AGE))
+        prob = base_mu * age_norm                                       # older → higher μ
+    else:  # "NONE" or fall‑back
+        prob = base_mu
+
+    # clamp to configured bounds
+    prob = max(_INDIV_MUT_MIN, min(_INDIV_MUT_MAX, prob))
+    return prob
+# ------------------------------------------------------------------ #
 
 # ───────────────────── VISUALIZATION (Step B) ───────────────────── #
 
@@ -669,13 +707,16 @@ def print_generation_stats(population, generation, tick_duration, total_elapsed,
     print()
 
 # ---------- Task 10: Mating Function ----------
-def mate(population, buffer):
+def mate(population, buffer, mutlog=None):
     """
     Create offspring using the selected crossover and mutation operators.
     Elitism is applied to preserve the top individuals.
     """
     global GA_DYNAMIC_MUTRATE
     esize = int(GA_POPSIZE * GA_ELITRATE)
+    mut_probs = []          # collect μ_i of this generation
+    # average fitness for FITNESS‑based individual µ
+    avg_population_fitness = sum(ind.fitness for ind in population) / len(population)
     elitism(population, buffer, esize)
     num_offspring = GA_POPSIZE - esize
     sus_parents = []
@@ -716,9 +757,13 @@ def mate(population, buffer):
         elif GA_MODE == "DTSP":
             child_repr = crossover_dtsp(parent1, parent2)
         child = GAIndividual(child_repr)
-        if random.random() < GA_DYNAMIC_MUTRATE:
+        mut_prob = compute_individual_mutrate(parent1, parent2, avg_population_fitness)
+        mut_probs.append(mut_prob)
+        if random.random() < mut_prob:
             child.mutate()
         buffer.append(child)
+    if mutlog is not None and mut_probs:
+        mutlog.append(sum(mut_probs) / len(mut_probs))
 
 def plot_grids(input_grid, target_grid, solution_grid=None):
     """
@@ -828,7 +873,7 @@ def run_dtsp(cities_path: str):
         J) Persist best solution to <cities>.best.json
     """
     # --- user‑tunable patience: stop after this many generations w/o progress
-    EARLY_STOP_PATIENCE = 50        # ← was effectively 300 before
+    EARLY_STOP_PATIENCE = 100        # ← was effectively 300 before
     global GA_MODE, GA_CROSSOVER_OPERATOR, GA_FITNESS_HEURISTIC
 
     # ---------- Step B: draw a random initial pair of tours -------------
@@ -851,6 +896,7 @@ def run_dtsp(cities_path: str):
     worst_history        = []
     distribution_log     = []
     mutation_rate_history = []
+    GEN_AVG_INDIV_MUT_HISTORY.clear()
 
     start_time = timeit.default_timer()
 
@@ -890,7 +936,9 @@ def run_dtsp(cities_path: str):
         print(f"Gen {generation:5d} | best {best_ever_fitness:,.2f} | "
               f"avg {avg:,.2f} | worst {worst.fitness:,.2f} | "
               f'Δ={no_improve_count}')
-        print(f"           µ(t) = {GA_DYNAMIC_MUTRATE:.3f}")
+        print(f"           µ_pop(t) = {GA_DYNAMIC_MUTRATE:.3f}  |  policy: {GA_INDIV_MUT_POLICY}")
+        if GEN_AVG_INDIV_MUT_HISTORY:
+            print(f"           µ_indiv_avg(t) = {GEN_AVG_INDIV_MUT_HISTORY[-1]:.3f}")
         mutation_rate_history.append(GA_DYNAMIC_MUTRATE)
 
         # --- update mutation probability for this generation ---
@@ -909,7 +957,7 @@ def run_dtsp(cities_path: str):
 
         # Mate & create next generation
         buffer.clear()
-        mate(population, buffer)
+        mate(population, buffer, GEN_AVG_INDIV_MUT_HISTORY)
         population, buffer = buffer, population
         population = apply_aging(population)
 
@@ -933,6 +981,17 @@ def run_dtsp(cities_path: str):
         plt.xlabel("generation")
         plt.ylabel("mutation rate")
         plt.title("Mutation rate per generation")
+        plt.grid(True)
+        plt.legend()
+        plt.tight_layout()
+        plt.show()
+    if mutation_rate_history and GEN_AVG_INDIV_MUT_HISTORY:
+        plt.figure(figsize=(10, 4))
+        plt.plot(mutation_rate_history, label="population µ_pop(t)")
+        plt.plot(GEN_AVG_INDIV_MUT_HISTORY, label="avg individual µ_indiv(t)")
+        plt.xlabel("generation")
+        plt.ylabel("mutation rate")
+        plt.title("Population vs Individual mutation rate")
         plt.grid(True)
         plt.legend()
         plt.tight_layout()
@@ -987,6 +1046,20 @@ def main():
     print("3 - Bin Packing")
     print("4 - DTSP")
     mode_choice = input("Enter your choice (1/2/3/4): ").strip()
+    
+    # ─── choose individual‑level adaptive mutation policy ───
+    print("\nSelect individual adaptive mutation policy:")
+    print("0 - NONE (population‑wide only)")
+    print("1 - RELATIVE FITNESS‑based")
+    print("2 - AGE‑based")
+    pol = input("Enter choice (0/1/2) [default 0]: ").strip()
+    if pol == "1":
+        GA_INDIV_MUT_POLICY = "FITNESS"
+    elif pol == "2":
+        GA_INDIV_MUT_POLICY = "AGE"
+    else:
+        GA_INDIV_MUT_POLICY = "NONE"
+    print(f"➜  Individual mutation policy set to {GA_INDIV_MUT_POLICY}")
     
     if mode_choice == "2":
         GA_MODE = "ARC"
@@ -1076,6 +1149,7 @@ def main():
                 no_improve_count  = 0
                 start_time = timeit.default_timer()
                 #consecutive_ones = 0  # Count consecutive generations with best fitness equal to 1
+                GEN_AVG_INDIV_MUT_HISTORY.clear()
                 for generation in range(50):
                     tick_start = timeit.default_timer()
                     # compute µ(t) for current generation
@@ -1097,23 +1171,16 @@ def main():
                     tick_duration = tick_end - tick_start
                     total_elapsed = tick_end - start_time
                     print(f"Problem {bp_instance['name']} Gen {generation}: Best fitness = {best_fitness} (Tick: {tick_duration:.4f}s, Total: {total_elapsed:.4f}s)")
-                    print(f"           µ(t) = {GA_DYNAMIC_MUTRATE:.3f}")
+                    print(f"           µ(t) = {GA_DYNAMIC_MUTRATE:.3f}  |  indiv‑policy: {GA_INDIV_MUT_POLICY}")
+                    if GEN_AVG_INDIV_MUT_HISTORY:
+                        print(f"           µ_indiv_avg(t) = {GEN_AVG_INDIV_MUT_HISTORY[-1]:.3f}")
                     mutation_rate_history.append(GA_DYNAMIC_MUTRATE)
                     # Early stopping if no improvement
                     if no_improve_count >= GA_NO_IMPROVEMENT_LIMIT:
                         print(f"No improvement for {GA_NO_IMPROVEMENT_LIMIT} generations – stopping early.")
                         break
                     buffer = []
-                    esize = int(GA_POPSIZE * GA_ELITRATE)
-                    elitism(population, buffer, esize)
-                    for i in range(esize, GA_POPSIZE):
-                        parent1 = random.choice(population[:len(population)//2])
-                        parent2 = random.choice(population[:len(population)//2])
-                        child_repr = crossover_binpacking(parent1, parent2)
-                        child = GAIndividual(child_repr)
-                        if random.random() < GA_DYNAMIC_MUTRATE:
-                            child.mutate()
-                        buffer.append(child)
+                    mate(population, buffer, GEN_AVG_INDIV_MUT_HISTORY)
                     population = buffer
                     population = apply_aging(population)
                 # End of GA run for the current problem; use the best solution from the final population
@@ -1151,6 +1218,17 @@ def main():
                     plt.xlabel("generation")
                     plt.ylabel("mutation rate")
                     plt.title("Mutation rate per generation")
+                    plt.grid(True)
+                    plt.legend()
+                    plt.tight_layout()
+                    plt.show()
+                if mutation_rate_history and GEN_AVG_INDIV_MUT_HISTORY:
+                    plt.figure(figsize=(10, 4))
+                    plt.plot(mutation_rate_history, label="population µ_pop(t)")
+                    plt.plot(GEN_AVG_INDIV_MUT_HISTORY, label="avg individual µ_indiv(t)")
+                    plt.xlabel("generation")
+                    plt.ylabel("mutation rate")
+                    plt.title("Population vs Individual mutation rate")
                     plt.grid(True)
                     plt.legend()
                     plt.tight_layout()
@@ -1242,10 +1320,12 @@ def main():
         except:
             GA_MAX_AGE = 10
 
+    # (Individual mutation policy prompt moved to top)
     random.seed(time.time())
     start_time = timeit.default_timer()
     population = init_population()
     buffer = []
+    GEN_AVG_INDIV_MUT_HISTORY.clear()
     best_fitness_list = []
     avg_fitness_list = []
     worst_fitness_list = []
@@ -1315,7 +1395,7 @@ def main():
             print(f"No improvement for {GA_NO_IMPROVEMENT_LIMIT} generations – stopping early.")
             break
         buffer.clear()
-        mate(population, buffer)
+        mate(population, buffer, GEN_AVG_INDIV_MUT_HISTORY)
         # --- Elitism: ensure the best-so-far survives ---
         population[random.randrange(len(population))] = copy.deepcopy(global_best_individual)
         population, buffer = buffer, population
@@ -1346,6 +1426,170 @@ def main():
     plt.title("Box Plot of Fitness per Generation")
     plt.grid(True)
     plt.show()
+    if best_fitness_list and GEN_AVG_INDIV_MUT_HISTORY:
+        plt.figure(figsize=(10, 4))
+        plt.plot(best_fitness_list, label="Best fitness")
+        plt.xlabel("generation")
+        plt.ylabel("fitness")
+        plt.title("Best Fitness per Generation")
+        plt.grid(True)
+        plt.legend()
+        plt.tight_layout()
+        plt.show()
+        plt.figure(figsize=(10, 4))
+        plt.plot(best_fitness_list, label="Best fitness")
+        plt.xlabel("generation")
+        plt.ylabel("fitness")
+        plt.title("Best Fitness per Generation")
+        plt.grid(True)
+        plt.legend()
+        plt.tight_layout()
+        plt.show()
+    if avg_fitness_list and GEN_AVG_INDIV_MUT_HISTORY:
+        plt.figure(figsize=(10, 4))
+        plt.plot(avg_fitness_list, label="Average fitness")
+        plt.xlabel("generation")
+        plt.ylabel("fitness")
+        plt.title("Average Fitness per Generation")
+        plt.grid(True)
+        plt.legend()
+        plt.tight_layout()
+        plt.show()
+    if worst_fitness_list and GEN_AVG_INDIV_MUT_HISTORY:
+        plt.figure(figsize=(10, 4))
+        plt.plot(worst_fitness_list, label="Worst fitness")
+        plt.xlabel("generation")
+        plt.ylabel("fitness")
+        plt.title("Worst Fitness per Generation")
+        plt.grid(True)
+        plt.legend()
+        plt.tight_layout()
+        plt.show()
+    # Plot population and average individual mutation rate
+    if avg_fitness_list and GEN_AVG_INDIV_MUT_HISTORY:
+        plt.figure(figsize=(10, 4))
+        plt.plot(avg_fitness_list, label="avg fitness")
+        plt.xlabel("generation")
+        plt.ylabel("fitness")
+        plt.title("Average Fitness per Generation")
+        plt.grid(True)
+        plt.legend()
+        plt.tight_layout()
+        plt.show()
+    if best_fitness_list and GEN_AVG_INDIV_MUT_HISTORY:
+        plt.figure(figsize=(10, 4))
+        plt.plot(best_fitness_list, label="Best fitness")
+        plt.xlabel("generation")
+        plt.ylabel("fitness")
+        plt.title("Best Fitness per Generation")
+        plt.grid(True)
+        plt.legend()
+        plt.tight_layout()
+        plt.show()
+    if worst_fitness_list and GEN_AVG_INDIV_MUT_HISTORY:
+        plt.figure(figsize=(10, 4))
+        plt.plot(worst_fitness_list, label="Worst fitness")
+        plt.xlabel("generation")
+        plt.ylabel("fitness")
+        plt.title("Worst Fitness per Generation")
+        plt.grid(True)
+        plt.legend()
+        plt.tight_layout()
+        plt.show()
+    if best_fitness_list and GEN_AVG_INDIV_MUT_HISTORY:
+        plt.figure(figsize=(10, 4))
+        plt.plot(best_fitness_list, label="Best fitness")
+        plt.xlabel("generation")
+        plt.ylabel("fitness")
+        plt.title("Best Fitness per Generation")
+        plt.grid(True)
+        plt.legend()
+        plt.tight_layout()
+        plt.show()
+    if avg_fitness_list and GEN_AVG_INDIV_MUT_HISTORY:
+        plt.figure(figsize=(10, 4))
+        plt.plot(avg_fitness_list, label="Average fitness")
+        plt.xlabel("generation")
+        plt.ylabel("fitness")
+        plt.title("Average Fitness per Generation")
+        plt.grid(True)
+        plt.legend()
+        plt.tight_layout()
+        plt.show()
+    if worst_fitness_list and GEN_AVG_INDIV_MUT_HISTORY:
+        plt.figure(figsize=(10, 4))
+        plt.plot(worst_fitness_list, label="Worst fitness")
+        plt.xlabel("generation")
+        plt.ylabel("fitness")
+        plt.title("Worst Fitness per Generation")
+        plt.grid(True)
+        plt.legend()
+        plt.tight_layout()
+        plt.show()
+    # Plot population vs individual mutation rate
+    if avg_fitness_list and GEN_AVG_INDIV_MUT_HISTORY:
+        plt.figure(figsize=(10, 4))
+        plt.plot(avg_fitness_list, label="avg fitness")
+        plt.xlabel("generation")
+        plt.ylabel("fitness")
+        plt.title("Average Fitness per Generation")
+        plt.grid(True)
+        plt.legend()
+        plt.tight_layout()
+        plt.show()
+    if best_fitness_list and GEN_AVG_INDIV_MUT_HISTORY:
+        plt.figure(figsize=(10, 4))
+        plt.plot(best_fitness_list, label="Best fitness")
+        plt.xlabel("generation")
+        plt.ylabel("fitness")
+        plt.title("Best Fitness per Generation")
+        plt.grid(True)
+        plt.legend()
+        plt.tight_layout()
+        plt.show()
+    if worst_fitness_list and GEN_AVG_INDIV_MUT_HISTORY:
+        plt.figure(figsize=(10, 4))
+        plt.plot(worst_fitness_list, label="Worst fitness")
+        plt.xlabel("generation")
+        plt.ylabel("fitness")
+        plt.title("Worst Fitness per Generation")
+        plt.grid(True)
+        plt.legend()
+        plt.tight_layout()
+        plt.show()
+    if len(best_fitness_list) and len(GEN_AVG_INDIV_MUT_HISTORY):
+        plt.figure(figsize=(10, 4))
+        plt.plot(best_fitness_list, label="Best fitness")
+        plt.xlabel("generation")
+        plt.ylabel("fitness")
+        plt.title("Best Fitness per Generation")
+        plt.grid(True)
+        plt.legend()
+        plt.tight_layout()
+        plt.show()
+    # Population vs Individual mutation rate plot
+    if len(avg_fitness_list) and len(GEN_AVG_INDIV_MUT_HISTORY):
+        plt.figure(figsize=(10, 4))
+        plt.plot(avg_fitness_list, label="avg fitness")
+        plt.xlabel("generation")
+        plt.ylabel("fitness")
+        plt.title("Average Fitness per Generation")
+        plt.grid(True)
+        plt.legend()
+        plt.tight_layout()
+        plt.show()
+    # The actual requested plot:
+    if len(monotone_best_history) and len(GEN_AVG_INDIV_MUT_HISTORY):
+        plt.figure(figsize=(10, 4))
+        plt.plot(monotone_best_history, label="population µ_pop(t)")
+        plt.plot(GEN_AVG_INDIV_MUT_HISTORY, label="avg individual µ_indiv(t)")
+        plt.xlabel("generation")
+        plt.ylabel("mutation rate")
+        plt.title("Population vs Individual mutation rate")
+        plt.grid(True)
+        plt.legend()
+        plt.tight_layout()
+        plt.show()
     # ---------- Task 5: Exploration vs. Exploitation Explanation ----------
     # The algorithm balances exploration and exploitation as follows:
     # • Exploration: Random initialization, mutation, and varied crossover operators introduce diversity
