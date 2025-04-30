@@ -16,7 +16,24 @@ GA_MAXITER = 16384    # Maximum number of generations (used in non-Bin Packing m
 # Stop if the global best fitness hasn’t improved for this many generations
 GA_NO_IMPROVEMENT_LIMIT = 300
 GA_ELITRATE = 0.1                # Elitism rate (percentage of best individuals preserved)
-GA_MUTATIONRATE = 0.5            # Mutation probability
+GA_MUTATIONRATE = 0.9            # Mutation probability
+
+# ───── Mutation–control policies (Task 2‑a) ────────────────────────── #
+GA_MUTATION_POLICY  = "LOGISTIC"   # "CONSTANT", "LOGISTIC", "THM"
+# LOGISTIC‑decay parameters
+GA_MUTRATE_MAX      = 0.9
+GA_MUTRATE_MIN      = 0.05
+GA_DECAY_RATE       = 0.03         # decay coefficient r
+# Triggered‑Hyper‑Mutation (THM) parameters
+GA_MUTRATE_BASE     = 0.10
+GA_MUTRATE_HYPER    = 0.70
+GA_THM_PATIENCE     = 30           # gens without improvement ⇒ burst
+GA_THM_DURATION     = 5            # gens to keep hyper‑µ active
+# runtime variables (updated each generation)
+GA_DYNAMIC_MUTRATE  = GA_MUTATIONRATE   # effective µ for the current gen
+_THM_BURST_REMAINING = 0
+# ───────────────────────────────────────────────────────────────────── #
+
 GA_TARGET = "Hello World!"        # Target string for the String evolution mode
 GA_CROSSOVER_OPERATOR = "SINGLE"  # Default crossover operator; may be updated based on user input
 
@@ -80,6 +97,29 @@ def _dist(a: int, b: int) -> float:
     d = math.hypot(x2 - x1, y2 - y1)
     _DISTANCE_CACHE[key] = d
     return d
+
+# ───────── dynamic mutation‑rate scheduler ────────────────────────── #
+def compute_mutation_rate(generation: int, stagnation_counter: int) -> float:
+    """
+    Return µ(t) according to GA_MUTATION_POLICY.
+    • LOGISTIC : µ = µ_min + (µ_max‑µ_min)·e^(‑r·t)
+    • THM      : If stagnation ≥ patience → burst (µ_hyper) for `GA_THM_DURATION`
+    • CONSTANT : legacy fixed GA_MUTATIONRATE.
+    """
+    global _THM_BURST_REMAINING
+    if GA_MUTATION_POLICY.upper() == "LOGISTIC":
+        return GA_MUTRATE_MIN + (GA_MUTRATE_MAX - GA_MUTRATE_MIN) * math.exp(-GA_DECAY_RATE * generation)
+    elif GA_MUTATION_POLICY.upper() == "THM":
+        if _THM_BURST_REMAINING > 0:
+            _THM_BURST_REMAINING -= 1
+            return GA_MUTRATE_HYPER
+        if stagnation_counter >= GA_THM_PATIENCE:
+            _THM_BURST_REMAINING = GA_THM_DURATION - 1
+            return GA_MUTRATE_HYPER
+        return GA_MUTRATE_BASE
+    else:  # CONSTANT
+        return GA_MUTATIONRATE
+# ───────────────────────────────────────────────────────────────────── #
 
 # ───────────────────── VISUALIZATION (Step B) ───────────────────── #
 
@@ -634,6 +674,7 @@ def mate(population, buffer):
     Create offspring using the selected crossover and mutation operators.
     Elitism is applied to preserve the top individuals.
     """
+    global GA_DYNAMIC_MUTRATE
     esize = int(GA_POPSIZE * GA_ELITRATE)
     elitism(population, buffer, esize)
     num_offspring = GA_POPSIZE - esize
@@ -675,7 +716,7 @@ def mate(population, buffer):
         elif GA_MODE == "DTSP":
             child_repr = crossover_dtsp(parent1, parent2)
         child = GAIndividual(child_repr)
-        if random.random() < GA_MUTATIONRATE:
+        if random.random() < GA_DYNAMIC_MUTRATE:
             child.mutate()
         buffer.append(child)
 
@@ -799,6 +840,7 @@ def run_dtsp(cities_path: str):
     GA_CROSSOVER_OPERATOR = "DTSP"
     GA_FITNESS_HEURISTIC  = "DTSP"
     population = init_population()
+    GA_DYNAMIC_MUTRATE = GA_MUTATIONRATE  # reset effective µ
     buffer     = []
 
     best_ever_fitness    = float("inf")
@@ -808,6 +850,7 @@ def run_dtsp(cities_path: str):
     avg_history          = []
     worst_history        = []
     distribution_log     = []
+    mutation_rate_history = []
 
     start_time = timeit.default_timer()
 
@@ -847,10 +890,16 @@ def run_dtsp(cities_path: str):
         print(f"Gen {generation:5d} | best {best_ever_fitness:,.2f} | "
               f"avg {avg:,.2f} | worst {worst.fitness:,.2f} | "
               f'Δ={no_improve_count}')
+        print(f"           µ(t) = {GA_DYNAMIC_MUTRATE:.3f}")
+        mutation_rate_history.append(GA_DYNAMIC_MUTRATE)
 
-        # Triggered hyper‑mutation on stagnation every 100 generations
-        if no_improve_count and no_improve_count % 100 == 0:
-            print('🧬  Hyper‑mutation triggered!')
+        # --- update mutation probability for this generation ---
+        GA_DYNAMIC_MUTRATE = compute_mutation_rate(generation, no_improve_count)
+
+        # Legacy hyper‑mutation (only when mutation policy is CONSTANT)
+        if (GA_MUTATION_POLICY.upper() == "CONSTANT"
+                and no_improve_count and no_improve_count % 100 == 0):
+            print('🧬  Legacy hyper‑mutation triggered!')
             for ind in population[int(0.5 * GA_POPSIZE):]:
                 ind.mutate_dtsp()   # high‑intensity mutation
 
@@ -876,6 +925,18 @@ def run_dtsp(cities_path: str):
         plt.tight_layout(); plt.show()
     except Exception as e:
         print(f"Plotting failed: {e}")
+
+    # ---------- µ(t) plot -------------------------------------------------
+    if mutation_rate_history:
+        plt.figure(figsize=(10, 4))
+        plt.plot(mutation_rate_history, label="µ(t)")
+        plt.xlabel("generation")
+        plt.ylabel("mutation rate")
+        plt.title("Mutation rate per generation")
+        plt.grid(True)
+        plt.legend()
+        plt.tight_layout()
+        plt.show()
 
     # ---------- Step I: visualise best paths ----------------------------
     # ===== Print best tours & their lengths for easy inspection =====
@@ -981,14 +1042,20 @@ def main():
                     "items": items
                 })
             print(f"Found {len(bp_problems)} bin packing problems.")
-            chosen_indices_str = input("Enter indices of 5 problems to solve (1-indexed, separated by commas, default first 5): ").strip()
-            if not chosen_indices_str:
-                chosen_indices = list(range(5))
+            # --- let the user select a single problem index ----
+            chosen_index_str = input(f"Select problem index (1‑{len(bp_problems)}), default 1: ").strip()
+            if not chosen_index_str:
+                chosen_indices = [0]
             else:
-                chosen_indices = [int(x.strip()) - 1 for x in chosen_indices_str.split(",")]
-                if len(chosen_indices) != 5:
-                    print("Invalid number of problems, defaulting to first 5.")
-                    chosen_indices = list(range(5))
+                try:
+                    idx = int(chosen_index_str) - 1
+                    if idx < 0 or idx >= len(bp_problems):
+                        print("Invalid index, defaulting to 1.")
+                        idx = 0
+                except ValueError:
+                    print("Invalid input, defaulting to 1.")
+                    idx = 0
+                chosen_indices = [idx]
             for index in chosen_indices:
                 bp_instance = bp_problems[index]
                 print(f"\nSolving bin packing problem {bp_instance['name']}: capacity {bp_instance['capacity']}, {bp_instance['num_items']} items, optimal bins {bp_instance['optimal']}")
@@ -1001,6 +1068,9 @@ def main():
                 buffer = []
                 best_solution = None
                 best_fitness_list = []
+                # ---- dynamic mutation‑rate tracking for Bin‑Packing ----
+                mutation_rate_history = []
+                GA_DYNAMIC_MUTRATE = GA_MUTATIONRATE   # reset to global default
                 # --- Early-stopping trackers ---
                 best_ever_fitness = float("inf")
                 no_improve_count  = 0
@@ -1008,6 +1078,8 @@ def main():
                 #consecutive_ones = 0  # Count consecutive generations with best fitness equal to 1
                 for generation in range(50):
                     tick_start = timeit.default_timer()
+                    # compute µ(t) for current generation
+                    GA_DYNAMIC_MUTRATE = compute_mutation_rate(generation, no_improve_count)
                     for ind in population:
                         ind.calculate_fitness_binpacking()
                     sort_population(population)
@@ -1025,6 +1097,8 @@ def main():
                     tick_duration = tick_end - tick_start
                     total_elapsed = tick_end - start_time
                     print(f"Problem {bp_instance['name']} Gen {generation}: Best fitness = {best_fitness} (Tick: {tick_duration:.4f}s, Total: {total_elapsed:.4f}s)")
+                    print(f"           µ(t) = {GA_DYNAMIC_MUTRATE:.3f}")
+                    mutation_rate_history.append(GA_DYNAMIC_MUTRATE)
                     # Early stopping if no improvement
                     if no_improve_count >= GA_NO_IMPROVEMENT_LIMIT:
                         print(f"No improvement for {GA_NO_IMPROVEMENT_LIMIT} generations – stopping early.")
@@ -1037,7 +1111,7 @@ def main():
                         parent2 = random.choice(population[:len(population)//2])
                         child_repr = crossover_binpacking(parent1, parent2)
                         child = GAIndividual(child_repr)
-                        if random.random() < GA_MUTATIONRATE:
+                        if random.random() < GA_DYNAMIC_MUTRATE:
                             child.mutate()
                         buffer.append(child)
                     population = buffer
@@ -1070,6 +1144,17 @@ def main():
                     sizes = [BP_ITEMS[i] for i in b]
                     total = sum(sizes)
                     print(f"Bin {idx}: {sizes}  (Total: {total}/{BP_CAPACITY})")
+                # ---- plot µ(t) curve for this Bin‑Packing run ----
+                if mutation_rate_history:
+                    plt.figure(figsize=(10, 4))
+                    plt.plot(mutation_rate_history, label="µ(t)")
+                    plt.xlabel("generation")
+                    plt.ylabel("mutation rate")
+                    plt.title("Mutation rate per generation")
+                    plt.grid(True)
+                    plt.legend()
+                    plt.tight_layout()
+                    plt.show()
             exit(0)
         except Exception as e:
             print("Error loading bin packing file:", e)
