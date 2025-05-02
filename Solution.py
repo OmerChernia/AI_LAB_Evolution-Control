@@ -16,13 +16,13 @@ from functools import lru_cache
 # Global GA parameters
 GA_POPSIZE = 512    # Population size for the genetic algorithm
 GA_MAXITER = 16384    # Maximum number of generations (used in non-Bin Packing modes)
-# Stop if the global best fitness hasn’t improved for this many generations
+# Stop if the global best fitness hasn't improved for this many generations
 GA_NO_IMPROVEMENT_LIMIT = 300
 GA_ELITRATE = 0.1                # Elitism rate (percentage of best individuals preserved)
 GA_MUTATIONRATE = 0.25            # Mutation probability
 
-# ───── Mutation–control policies (Task 2‑a) ────────────────────────── #
-GA_MUTATION_POLICY  = "THM"   # "CONSTANT", "LOGISTIC", "THM"
+# ───── Mutation–control policies (Task 2‑a) ────────────────────────── #
+GA_MUTATION_POLICY  = "CONSTANT"   # "CONSTANT", "LOGISTIC", "THM"
 # LOGISTIC‑decay parameters
 GA_MUTRATE_MAX      = 0.9
 GA_MUTRATE_MIN      = 0.05
@@ -40,14 +40,15 @@ GEN_AVG_INDIV_MUT_HISTORY: list[float] = []
 # ───────────────────────────────────────────────────────────────────── #
 
 
-# ───── Individual‑level adaptive mutation (Task 2‑b) ───── #
+# ───── Individual‑level adaptive mutation (Task 2‑b) ───── #
 # Options: "NONE" (default), "FITNESS" (relative fitness), "AGE" (age‑based)
-GA_INDIV_MUT_POLICY = "FITNESS"
+GA_INDIV_MUT_POLICY = "NONE"
 _INDIV_MUT_MIN      = GA_MUTRATE_MIN
 _INDIV_MUT_MAX      = GA_MUTRATE_MAX
 # --------------------------------------------------------- #
 
-# ───── Adaptive *fitness* augmentation (Task 2‑c) ───── #
+
+# ───── Adaptive *fitness* augmentation (Task 2‑c) ───── #
 # Choose an auxiliary reward g(x,t) that is **added** (or subtracted)
 # to the raw problem fitness before selection is applied.
 # Options: "NONE" (raw fitness only), "AGE" (age‑based reward),
@@ -57,6 +58,16 @@ AGE_WEIGHT          = 1.0       # fitness += AGE_WEIGHT * age
 NOVELTY_K           = 5         # number of neighbours for novelty
 NOVELTY_WEIGHT      = 1.0       # fitness -= NOVELTY_WEIGHT * novelty
 GEN_AVG_G_HISTORY: list[float] = []   # log ⟨g(x,t)⟩ per generation
+
+# ───── Niching / Speciation (Task 4) ───── #
+# Choose how to reduce crowding in the population.
+#   "NONE"       : no niching (default – legacy behaviour)
+#   "SHARING"    : fitness‑sharing within a radius (Goldberg & Richardson, 1987)
+#   "SPECIATION" : NEAT‑style speciation threshold
+GA_NICHING_ALGO  = "NONE"     #  "NONE" | "SHARING" | "SPECIATION"
+SHARING_RADIUS   = 0.4       # r_s  – neighbourhood radius for fitness‑sharing
+SPECIES_THRESHOLD = 0.30      # δ_t – max intra‑species distance
+SPECIES_PENALTY  = 0.10       # additive penalty per extra member in a species
 
 # ─── Performance tweak: compute novelty only every k generations ─── #
 NOVELTY_PERIOD      = 5      # calculate novelty reward once every k gens
@@ -130,7 +141,7 @@ def _dist(a: int, b: int) -> float:
     _DISTANCE_CACHE[key] = d
     return d
 
-# ───────── Gene‑Distance metrics  (Task 3) ───────── #
+# ───────── Gene‑Distance metrics  (Task 3) ───────── #
 
 _MAX_CITY_DIST = None  # DTSP – calculated lazily once
 
@@ -203,7 +214,7 @@ def compute_individual_mutrate(parent1, parent2, avg_fit):
     GA_DYNAMIC_MUTRATE so that both schedulers operate together.
 
     • "NONE"    : μ_i = GA_DYNAMIC_MUTRATE          (population wide only)
-    • "FITNESS" : μ_i = μ_global · (1 – relative_fitness)
+    • "FITNESS" : μ_i = μ_global · (1 – relative_fitness)
     • "AGE"     : μ_i = μ_global · age_norm
                  where age_norm = max(parent.age)/GA_MAX_AGE  in [0,1]
     The returned value is finally clamped to [_INDIV_MUT_MIN, _INDIV_MUT_MAX].
@@ -415,7 +426,7 @@ class GAIndividual:
 
         # קשתות משותפות לשני המסלולים (ללא כיוון)
         common_edges = edges1 & edges2
-        penalty = len(common_edges) * 10_000_000  # 10 מיל׳ לכל חפיפה
+        penalty = len(common_edges) * 10_000  # 10 מיל׳ לכל חפיפה
 
         # כושר = אורך המסלול הארוך + קנס
         self.fitness = max(total1, total2) + penalty
@@ -629,17 +640,16 @@ def crossover_dtsp(parent1, parent2):
 
 # ---------- Task 10: Parent Selection Methods ----------
 def select_parent_RWS(population):
-    """
-    Select a parent using Roulette Wheel Selection (fitness-proportional).
-    The probability of selection is proportional to (worst - fitness).
-    """
+    """Select a parent using Roulette Wheel Selection (fitness-proportional).
+    Minimisation is assumed – therefore the selection probability is
+    proportional to (worst − fitness)."""
     worst = max(ind.fitness for ind in population)
     adjusted = [worst - ind.fitness for ind in population]
     total = sum(adjusted)
     if total == 0:
         return random.choice(population)
     r = random.uniform(0, total)
-    cum = 0
+    cum = 0.0
     for ind, val in zip(population, adjusted):
         cum += val
         if cum >= r:
@@ -758,7 +768,7 @@ def compute_diversity_metrics(population):
         return (0, 0, 0)
 
 
-# ────────── Helper for Task 2‑c: novelty score ────────── #
+# ────────── Helper for Task 2‑c: novelty score ────────── #
 def _behavioural_distance(ind1: 'GAIndividual', ind2: 'GAIndividual') -> float:
     """
     A quick, domain‑agnostic distance between two individuals.
@@ -815,7 +825,62 @@ def compute_novelty(ind: 'GAIndividual', population: list['GAIndividual']) -> fl
     return sum(dists[:k]) / k if k else 0.0
 
 
-# ───── Routine to augment fitness with g(x,t) (Task 2‑c) ───── #
+# ───────── Niching / Speciation helper (Task 4) ───────── #
+def _apply_niching(population: list['GAIndividual']):
+    """
+    Post‑process `.fitness` according to GA_NICHING_ALGO **after**
+    raw/auxiliary fitnesses were set.  Works with the generic
+    _behavioural_distance() already available for all modes.
+
+    • "SHARING"    : multiply fitness by (1 + Σ sh(d_ij)) where
+                     sh(d) = 1 – d/r  for d < r,   else 0
+                     (minimisation ⇒ worse when too crowded).
+
+    • "SPECIATION" : cluster individuals greedily; every individual is
+                     assigned to the first representative closer than
+                     SPECIES_THRESHOLD.  Fitness is penalised by
+                     SPECIES_PENALTY·( |species| – 1 ).
+    """
+    if GA_NICHING_ALGO == "NONE":
+        return
+
+    if GA_NICHING_ALGO == "SHARING":
+        n = len(population)
+        for i, ind_i in enumerate(population):
+            share_sum = 0.0
+            for j, ind_j in enumerate(population):
+                if i == j:
+                    continue
+                d = _behavioural_distance(ind_i, ind_j)
+                if d < SHARING_RADIUS:
+                    share_sum += 1.0 - (d / SHARING_RADIUS)
+            if share_sum > 0.0:
+                ind_i.fitness *= (1.0 + share_sum)   # minimisation ⇒ up‑scale
+
+    elif GA_NICHING_ALGO == "SPECIATION":
+        representatives: list['GAIndividual'] = []
+        species: list[list['GAIndividual']] = []
+        # --- greedy assignment -----------------------------------------
+        for ind in population:
+            assigned = False
+            for s_idx, rep in enumerate(representatives):
+                if _behavioural_distance(ind, rep) < SPECIES_THRESHOLD:
+                    species[s_idx].append(ind)
+                    assigned = True
+                    break
+            if not assigned:
+                representatives.append(ind)
+                species.append([ind])
+
+        # penalty grows with species size
+        for sp in species:
+            if len(sp) <= 1:
+                continue
+            penalty = SPECIES_PENALTY * (len(sp) - 1)
+            for ind in sp:
+                ind.fitness += penalty
+
+# ───── Routine to augment fitness with g(x,t) (Task 2‑c) ───── #
 def apply_adaptive_fitness(population: list['GAIndividual']):
     """
     Modify each individual's `.fitness` in‑place according to GA_ADAPT_FIT_POLICY.
@@ -829,9 +894,13 @@ def apply_adaptive_fitness(population: list['GAIndividual']):
     if GA_ADAPT_FIT_POLICY == "NOVELTY" and CURRENT_GENERATION % NOVELTY_PERIOD != 0:
         # keep last logged g(x,t) value so the plot length stays in sync
         GEN_AVG_G_HISTORY.append(GEN_AVG_G_HISTORY[-1] if GEN_AVG_G_HISTORY else 0.0)
+        # --- Task 4: niching/speciation post‑processing ---
+        _apply_niching(population)
         return
     if GA_ADAPT_FIT_POLICY == "NONE":
         GEN_AVG_G_HISTORY.append(0.0)
+        # --- Task 4: niching/speciation post‑processing ---
+        _apply_niching(population)
         return
     g_vals = []
     if GA_ADAPT_FIT_POLICY == "AGE":
@@ -867,6 +936,8 @@ def apply_adaptive_fitness(population: list['GAIndividual']):
             ind.fitness += g
             g_vals.append(nov)
     GEN_AVG_G_HISTORY.append(sum(g_vals) / len(g_vals) if g_vals else 0.0)
+    # --- Task 4: niching/speciation post‑processing ---
+    _apply_niching(population)
 
 # ---------- Task 1: Generation Stats, Task 8 & Task 9 Combined ----------
 def print_generation_stats(population, generation, tick_duration, total_elapsed, best_ever_fitness=None):
@@ -1118,10 +1189,10 @@ def run_dtsp(cities_path: str):
     apply_adaptive_fitness(population)
     sort_population(population)
 
-    # ---------- Step E + F + G: evolutionary loop -----------------------
+    # ---------- Step E + F + G: evolutionary loop -----------------------
     for generation in range(GA_MAXITER):
         CURRENT_GENERATION = generation
-        # Step F – local 2‑opt every 50 generations
+        # Step F – local 2‑opt every 50 generations
         if generation and generation % 50 == 0:
             for ind in population:
                 ind.local_optimize_dtsp()
@@ -1140,7 +1211,7 @@ def run_dtsp(cities_path: str):
         worst_history.append(worst.fitness)
         distribution_log.append([ind.fitness for ind in population])
 
-        # Step G – global‑best tracking & stagnation counter
+        # Step G – global‑best tracking & stagnation counter
         if best.fitness < best_ever_fitness - 1e-9:
             best_ever_fitness    = best.fitness
             best_ever_individual = copy.deepcopy(best)
@@ -1221,8 +1292,19 @@ def run_dtsp(cities_path: str):
         plt.show()
 
     # ---------- Step I: visualise best paths ----------------------------
-    # ===== Print best tours & their lengths for easy inspection =====
+    # ===== Ensure best solution is disjoint; attempt final repair =====
     if best_ever_individual is not None:
+        # --- attempt automatic repair if edge overlap remains ---
+        attempts = 0
+        while tours_edge_overlap(*best_ever_individual.repr) and attempts < 10:
+            best_ever_individual.repair_dtsp()
+            best_ever_individual.local_optimize_dtsp()
+            best_ever_individual.calculate_fitness_dtsp()
+            attempts += 1
+        # update stored fitness after possible repair
+        best_ever_fitness = best_ever_individual.fitness
+
+        # ===== Print best tours & their lengths for easy inspection =====
         def _path_len(path):
             return sum(_dist(path[i], path[(i + 1) % len(path)])
                        for i in range(len(path)))
@@ -1234,10 +1316,10 @@ def run_dtsp(cities_path: str):
 
         print("\n──────────  BEST DTSP SOLUTION  ──────────")
         print(f"Fitness (max tour length): {best_ever_fitness:,.2f}")
-        print(f"Tour 1 length: {_path_len(tour1):,.2f}  |  Valid cycle: {valid1}")
-        print(f"Tour 1 order (closed): {tour1 + [tour1[0]]}")
-        print(f"Tour 2 length: {_path_len(tour2):,.2f}  |  Valid cycle: {valid2}")
-        print(f"Tour 2 order (closed): {tour2 + [tour2[0]]}")
+        print(f"Tour 1 length: {_path_len(tour1):,.2f}  |  Valid cycle: {valid1}")
+        print(f"Tour 1 order (closed): {tour1 + [tour1[0]]}")
+        print(f"Tour 2 length: {_path_len(tour2):,.2f}  |  Valid cycle: {valid2}")
+        print(f"Tour 2 order (closed): {tour2 + [tour2[0]]}")
         print(f"Edge overlap between tours: {overlap}")
         print("──────────────────────────────────────────\n")
 
@@ -1246,7 +1328,7 @@ def run_dtsp(cities_path: str):
                   "(non‑Hamiltonian cycle or edge overlap). "
                   "Consider increasing evolution time or enabling repair heuristics.")
         plot_dtsp_paths(best_ever_individual.repr,
-                        title=f"Step I – best fitness {best_ever_fitness:,.2f}")
+                        title=f"Step I – best fitness {best_ever_fitness:,.2f}")
 
     # ---------- Step J: persist solution --------------------------------
     out_path = Path(cities_path).with_suffix(".best.json")
@@ -1259,6 +1341,132 @@ def run_dtsp(cities_path: str):
     except Exception as e:
         print(f"Could not save best solution: {e}")
 
+def run_baldwin_experiment():
+    import matplotlib.pyplot as plt
+
+    # ---------------- Experimental constants ------------------
+    GENOME_LENGTH      = 20
+    POP_SIZE           = 1000
+    LEARNING_TRIALS    = 1000
+    MAX_GENERATIONS    = 200
+
+    # hidden target (fixed for the entire run)
+    TARGET = [random.choice('01') for _ in range(GENOME_LENGTH)]
+
+    # helper: create a single random genome according to the required distr.
+    def _random_genome():
+        genome = []
+        for bit in TARGET:
+            r = random.random()
+            if r < 0.5:
+                genome.append('?')
+            elif r < 0.75:
+                genome.append(bit)              # correct
+            else:
+                genome.append('1' if bit == '0' else '0')  # incorrect
+        return genome
+
+    population = [_random_genome() for _ in range(POP_SIZE)]
+
+    # --- statistics logging ---
+    perc_correct = []
+    perc_incorrect = []
+    perc_question = []
+
+    for gen in range(MAX_GENERATIONS):
+        # -------- evaluate fitness with learning -------------
+        fitness = []
+        for genome in population:
+            # quick check: any incorrect hard-wired allele → fitness 1 (n=0)
+            impossible = any((g != '?' and g != t) for g, t in zip(genome, TARGET))
+            if impossible:
+                fitness.append(1.0)  # n = 0 ⇒ f = 1
+                continue
+            # otherwise simulate up-to LEARNING_TRIALS attempts
+            n = 0
+            success = False
+            for trial in range(LEARNING_TRIALS):
+                # fill '?' with random bits
+                candidate = [g if g != '?' else random.choice('01') for g in genome]
+                if candidate == TARGET:
+                    success = True
+                    n = LEARNING_TRIALS - trial  # trials left *including* this one
+                    break
+            if not success:
+                n = 0
+            fitness.append(1.0 + 19.0 * n / LEARNING_TRIALS)
+
+        # --------- log population averages for the plot ----------
+        cnt_correct = 0
+        cnt_incorrect = 0
+        cnt_q = 0
+        for genome in population:
+            for a, t in zip(genome, TARGET):
+                if a == '?':
+                    cnt_q += 1
+                elif a == t:
+                    cnt_correct += 1
+                else:
+                    cnt_incorrect += 1
+        total_alleles = POP_SIZE * GENOME_LENGTH
+        perc_correct.append(100.0 * cnt_correct / total_alleles)
+        perc_incorrect.append(100.0 * cnt_incorrect / total_alleles)
+        perc_question.append(100.0 * cnt_q / total_alleles)
+
+        # ---------------- reproduction (RWS) ----------------------
+        # --- Roulette-Wheel Selection (maximisation) ---
+        total_fit = sum(fitness)
+        if total_fit == 0:
+            probs = [1.0 / POP_SIZE] * POP_SIZE
+        else:
+            probs = [f / total_fit for f in fitness]
+
+        # cumulative prob table
+        cumprob = []
+        s = 0.0
+        for p in probs:
+            s += p
+            cumprob.append(s)
+
+        def _select_parent():
+            r = random.random()
+            for idx, cp in enumerate(cumprob):
+                if r <= cp:
+                    return population[idx]
+            return population[-1]
+
+        new_population = []
+        for _ in range(POP_SIZE):
+            p1 = _select_parent()
+            p2 = _select_parent()
+            child = [random.choice([a, b]) for a, b in zip(p1, p2)]
+            new_population.append(child)
+        population = new_population
+
+    # -------------------- plotting ---------------------------
+    gens = list(range(MAX_GENERATIONS))
+    plt.figure(figsize=(10, 5))
+    plt.plot(gens, perc_correct, label="Correct hard-wired")
+    plt.plot(gens, perc_incorrect, label="Incorrect hard-wired")
+    plt.plot(gens, perc_question, label="Learnable '?'", linestyle='--')
+    plt.xlabel("Generation")
+    plt.ylabel("Percentage of loci (%)")
+    plt.title("Baldwin Effect – population averages over time")
+    plt.legend()
+    plt.grid(True)
+    plt.tight_layout()
+    plt.show()
+
+    # --------------- simple console verdict -----------------
+    print("\nFinal averages: ")
+    print(f"  Correct   : {perc_correct[-1]:.1f}%")
+    print(f"  Incorrect : {perc_incorrect[-1]:.1f}%")
+    print(f"  '?' loci  : {perc_question[-1]:.1f}%")
+    if perc_incorrect[-1] < 1 and perc_question[-1] < 5:
+        print("\nObservation: Incorrect alleles vanished and most '?' loci became genetically fixed – consistent with the Baldwin Effect.")
+    else:
+        print("\nObservation: The expected pattern (drop in incorrect + '?' loci) is weak — perhaps more generations are needed.")
+
 def main():
     global GA_MODE, GA_ARC_TARGET_GRID, GA_ARC_INPUT_GRID, bp_instance
     global GA_FITNESS_HEURISTIC, GA_CROSSOVER_OPERATOR
@@ -1269,7 +1477,8 @@ def main():
     print("2 - ARC puzzle")
     print("3 - Bin Packing")
     print("4 - DTSP")
-    mode_choice = input("Enter your choice (1/2/3/4): ").strip()
+    print("5 - Baldwin Effect experiment")
+    mode_choice = input("Enter your choice (1/2/3/4/5): ").strip()
     
     # ─── choose individual‑level adaptive mutation policy ───
     print("\nSelect individual adaptive mutation policy:")
@@ -1285,7 +1494,7 @@ def main():
         GA_INDIV_MUT_POLICY = "NONE"
     print(f"➜  Individual mutation policy set to {GA_INDIV_MUT_POLICY}")
 
-    # ─── choose adaptive *fitness* augmentation policy (Task 2‑c) ───
+    # ─── choose adaptive *fitness* augmentation policy (Task 2‑c) ───
     print("\nSelect adaptive fitness augmentation:")
     print("0 - NONE (raw problem fitness only)")
     print("1 - AGE reward  (fitness += age)")
@@ -1519,6 +1728,9 @@ def main():
         #    and allow the search to explore new regions of the solution space.
         # • Exploitation: Sorting, elitism, and selecting parents based on the chosen selection method
         #    ensure that the best solutions are propagated and refined over generations.
+    elif mode_choice == "5":
+        run_baldwin_experiment()
+        return
     else:
         GA_MODE = "STRING"
         print("Select fitness heuristic:")
