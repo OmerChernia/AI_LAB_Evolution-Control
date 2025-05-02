@@ -10,6 +10,9 @@ import copy
 import sys
 from pathlib import Path  # needed for TSPLIB loader
 
+# For optional caching (used in DTSP novelty, if needed)
+from functools import lru_cache
+
 # Global GA parameters
 GA_POPSIZE = 512    # Population size for the genetic algorithm
 GA_MAXITER = 16384    # Maximum number of generations (used in non-Bin Packing modes)
@@ -36,12 +39,32 @@ _THM_BURST_REMAINING = 0
 GEN_AVG_INDIV_MUT_HISTORY: list[float] = []
 # ───────────────────────────────────────────────────────────────────── #
 
+
 # ───── Individual‑level adaptive mutation (Task 2‑b) ───── #
 # Options: "NONE" (default), "FITNESS" (relative fitness), "AGE" (age‑based)
 GA_INDIV_MUT_POLICY = "FITNESS"
 _INDIV_MUT_MIN      = GA_MUTRATE_MIN
 _INDIV_MUT_MAX      = GA_MUTRATE_MAX
 # --------------------------------------------------------- #
+
+# ───── Adaptive *fitness* augmentation (Task 2‑c) ───── #
+# Choose an auxiliary reward g(x,t) that is **added** (or subtracted)
+# to the raw problem fitness before selection is applied.
+# Options: "NONE" (raw fitness only), "AGE" (age‑based reward),
+#          "NOVELTY" (k‑NN behavioural‑novelty reward)
+GA_ADAPT_FIT_POLICY = "NONE"
+AGE_WEIGHT          = 1.0       # fitness += AGE_WEIGHT * age
+NOVELTY_K           = 5         # number of neighbours for novelty
+NOVELTY_WEIGHT      = 1.0       # fitness -= NOVELTY_WEIGHT * novelty
+GEN_AVG_G_HISTORY: list[float] = []   # log ⟨g(x,t)⟩ per generation
+
+# ─── Performance tweak: compute novelty only every k generations ─── #
+NOVELTY_PERIOD      = 5      # calculate novelty reward once every k gens
+CURRENT_GENERATION  = 0      # updated from the evolution loops
+# ─────────────────────────────────────────────────────────────────── #
+
+# Novelty sampling: sample size for estimating novelty (speeds‑up)
+NOVELTY_SAMPLE = 25        # sample size when estimating novelty (speeds‑up)
 
 GA_TARGET = "Hello World!"        # Target string for the String evolution mode
 GA_CROSSOVER_OPERATOR = "SINGLE"  # Default crossover operator; may be updated based on user input
@@ -241,6 +264,11 @@ class GAIndividual:
             self.repr = representation if representation is not None else self.random_repr()
         self.fitness = 0  # The fitness value of the individual (lower is better for our minimization problems)
         self.age = 0      # The age in generations (used for aging-based survivor selection)
+        # cache for behavioural‑distance calculations
+        self._edge_union = None
+        self._perm_index = None
+        if GA_MODE == "BINPACKING":
+            self._update_perm_index()
 
     def random_repr(self):
         """Generate a random representation based on the current GA mode."""
@@ -366,6 +394,21 @@ class GAIndividual:
             edges.append((a, b))
         return edges  # מחזיר את כל הקשתות כולל כפילויות באותו מסלול
 
+    # ───────── cached union‑of‑edges helper (for novelty) ────────
+    def _get_edge_union(self):
+        """
+        Return a *cached* set of undirected edges across **both** DTSP tours.
+        Re‑computes the set only if the cache is invalidated (None).
+        """
+        if self._edge_union is not None or GA_MODE != "DTSP":
+            return self._edge_union
+        path1, path2 = self.repr
+        def edge_set(path):
+            return {tuple(sorted((path[i], path[(i + 1) % len(path)])))
+                    for i in range(len(path))}
+        self._edge_union = edge_set(path1) | edge_set(path2)
+        return self._edge_union
+
     def mutate(self):
         """
         Apply mutation to the individual.
@@ -381,8 +424,18 @@ class GAIndividual:
         elif GA_MODE == "BINPACKING":
             a, b = random.sample(range(len(self.repr)), 2)
             self.repr[a], self.repr[b] = self.repr[b], self.repr[a]
+            # keep cached positions in sync
+            if self._perm_index is not None:
+                self._perm_index[self.repr[a]], self._perm_index[self.repr[b]] = a, b
+            # 2-opt not applicable; ensure _update_perm_index is called only if cache is missing
+            if self._perm_index is None:
+                self._update_perm_index()
         elif GA_MODE == "DTSP":
             self.mutate_dtsp()
+    def _update_perm_index(self):
+        """Cache a mapping item->position for fast rank distance (Bin Packing novelty)."""
+        if GA_MODE == "BINPACKING":
+            self._perm_index = {item: idx for idx, item in enumerate(self.repr)}
 
     def mutate_dtsp(self):
         """מוטציה משופרת עם היפוך תת-מסלול"""
@@ -399,6 +452,7 @@ class GAIndividual:
             start, end = sorted(random.sample(range(len(path)), 2))
             path[start:end+1] = path[start:end+1][::-1]
         self.repair_dtsp()  # הוספת תיקון אוטומטי לאחר מוטציה
+        self._edge_union = None
 
     def repair_dtsp(self):
         """
@@ -433,12 +487,14 @@ class GAIndividual:
             else:
                 i, j = sorted((idx2, (idx2 + 1) % len(path2)))
                 path2[i:j + 1] = reversed(path2[i:j + 1])
+        self._edge_union = None
     
     def local_optimize_dtsp(self):
         """Apply 2-opt independently to both tours (Step F)."""
         p1, p2 = self.repr
         two_opt(p1)
         two_opt(p2)
+        self._edge_union = None
 
 def init_population():
     """Initialize and return a list of GAIndividual objects forming the initial population."""
@@ -658,6 +714,117 @@ def compute_diversity_metrics(population):
     else:  # Bin Packing
         return (0, 0, 0)
 
+
+# ────────── Helper for Task 2‑c: novelty score ────────── #
+def _behavioural_distance(ind1: 'GAIndividual', ind2: 'GAIndividual') -> float:
+    """
+    A quick, domain‑agnostic distance between two individuals.
+    • STRING   : normalised Hamming distance.
+    • BINPACK  : Kendall‑Tau distance between permutations (normalised).
+    • DTSP     : fraction of *differing* undirected edges across *both* tours.
+    • ARC      : Hamming distance of flattened grids (normalised).
+    The distance is mapped to [0,1].
+    """
+    if GA_MODE == "STRING":
+        L = len(GA_TARGET)
+        return sum(a != b for a, b in zip(ind1.repr, ind2.repr)) / L
+    elif GA_MODE == "BINPACKING":
+        # Spearman Footrule distance (O(n)) using cached indices
+        perm1, perm2 = ind1.repr, ind2.repr
+        n = len(perm1)
+        # ensure caches are ready
+        if ind1._perm_index is None:
+            ind1._update_perm_index()
+        if ind2._perm_index is None:
+            ind2._update_perm_index()
+        diff = sum(abs(ind1._perm_index[item] - ind2._perm_index[item]) for item in perm1)
+        max_diff = n * (n - 1) / 2  # maximal possible footrule distance
+        return diff / max_diff
+    elif GA_MODE == "DTSP":
+        e1 = ind1._get_edge_union()
+        e2 = ind2._get_edge_union()
+        if not e1 or not e2:
+            return 0.0
+        diff  = len(e1.symmetric_difference(e2))
+        union = len(e1 | e2)
+        return diff / union if union else 0.0
+    elif GA_MODE == "ARC":
+        flat1 = sum(ind1.repr, [])
+        flat2 = sum(ind2.repr, [])
+        L = len(flat1)
+        return sum(a != b for a, b in zip(flat1, flat2)) / L
+    return 0.0
+
+def compute_novelty(ind: 'GAIndividual', population: list['GAIndividual']) -> float:
+    """
+    Behavioural novelty ≈ average distance to k‑nearest neighbours.
+    Uses a *random sample* of at most NOVELTY_SAMPLE peers to keep the
+    complexity roughly O(k·log k) instead of O(N²).
+    """
+    if len(population) <= 1:
+        return 0.0
+    sample = random.sample(
+        [peer for peer in population if peer is not ind],
+        k=min(NOVELTY_SAMPLE, len(population) - 1)
+    )
+    dists = sorted(_behavioural_distance(ind, peer) for peer in sample)
+    k = min(NOVELTY_K, len(dists))
+    return sum(dists[:k]) / k if k else 0.0
+
+
+# ───── Routine to augment fitness with g(x,t) (Task 2‑c) ───── #
+def apply_adaptive_fitness(population: list['GAIndividual']):
+    """
+    Modify each individual's `.fitness` in‑place according to GA_ADAPT_FIT_POLICY.
+    This happens *after* raw fitness was computed and *before* selection/sort.
+    The transformation preserves ordering for minimisation.
+    Also logs ⟨g(x,t)⟩ for analysis/plots.
+    (Optimised distance‑matrix shortcut when GA_ADAPT_FIT_POLICY == 'NOVELTY')
+    """
+    global CURRENT_GENERATION
+    # Skip expensive novelty calculation except every NOVELTY_PERIOD generations
+    if GA_ADAPT_FIT_POLICY == "NOVELTY" and CURRENT_GENERATION % NOVELTY_PERIOD != 0:
+        # keep last logged g(x,t) value so the plot length stays in sync
+        GEN_AVG_G_HISTORY.append(GEN_AVG_G_HISTORY[-1] if GEN_AVG_G_HISTORY else 0.0)
+        return
+    if GA_ADAPT_FIT_POLICY == "NONE":
+        GEN_AVG_G_HISTORY.append(0.0)
+        return
+    g_vals = []
+    if GA_ADAPT_FIT_POLICY == "AGE":
+        for ind in population:
+            g = AGE_WEIGHT * ind.age
+            ind.fitness += g                # older ⇒ worse (minimisation)
+            g_vals.append(g)
+    elif GA_ADAPT_FIT_POLICY == "NOVELTY":
+        # --- Optimised novelty computation ---
+        # Pre‑compute a symmetric distance matrix once per generation to
+        # avoid O(N²) repeated calls to _behavioural_distance inside
+        # compute_novelty().  This keeps runtime manageable even for large
+        # populations.
+        n = len(population)
+        dist = [[0.0] * n for _ in range(n)]
+        for i in range(n):
+            for j in range(i + 1, n):
+                d = _behavioural_distance(population[i], population[j])
+                dist[i][j] = d
+                dist[j][i] = d
+
+        k = min(NOVELTY_K, n - 1)  # k‑NN neighbourhood
+        novs = []
+        for i in range(n):
+            # exclude self‑distance (0) and take k nearest neighbours
+            neighbours = sorted(dist[i][:i] + dist[i][i + 1:])
+            nov = sum(neighbours[:k]) / k if k else 0.0
+            novs.append(nov)
+
+        # Apply novelty reward (encourages exploration)
+        for ind, nov in zip(population, novs):
+            g = -NOVELTY_WEIGHT * nov    # more novel ⇒ *lower* fitness (minimisation)
+            ind.fitness += g
+            g_vals.append(nov)
+    GEN_AVG_G_HISTORY.append(sum(g_vals) / len(g_vals) if g_vals else 0.0)
+
 # ---------- Task 1: Generation Stats, Task 8 & Task 9 Combined ----------
 def print_generation_stats(population, generation, tick_duration, total_elapsed, best_ever_fitness=None):
     """
@@ -872,6 +1039,7 @@ def run_dtsp(cities_path: str):
         I) Visualise best pair of tours
         J) Persist best solution to <cities>.best.json
     """
+    global CURRENT_GENERATION
     # --- user‑tunable patience: stop after this many generations w/o progress
     EARLY_STOP_PATIENCE = 100        # ← was effectively 300 before
     global GA_MODE, GA_CROSSOVER_OPERATOR, GA_FITNESS_HEURISTIC
@@ -903,10 +1071,13 @@ def run_dtsp(cities_path: str):
     # ---------- Step D: initial evaluation ------------------------------
     for ind in population:
         ind.calculate_fitness_dtsp()
+    CURRENT_GENERATION = 0   # generation counter initialisation
+    apply_adaptive_fitness(population)
     sort_population(population)
 
     # ---------- Step E + F + G: evolutionary loop -----------------------
     for generation in range(GA_MAXITER):
+        CURRENT_GENERATION = generation
         # Step F – local 2‑opt every 50 generations
         if generation and generation % 50 == 0:
             for ind in population:
@@ -915,6 +1086,7 @@ def run_dtsp(cities_path: str):
         # Re‑evaluate & sort
         for ind in population:
             ind.calculate_fitness_dtsp()
+        apply_adaptive_fitness(population)      # ← NEW
         sort_population(population)
 
         best   = population[0]
@@ -936,9 +1108,11 @@ def run_dtsp(cities_path: str):
         print(f"Gen {generation:5d} | best {best_ever_fitness:,.2f} | "
               f"avg {avg:,.2f} | worst {worst.fitness:,.2f} | "
               f'Δ={no_improve_count}')
-        print(f"           µ_pop(t) = {GA_DYNAMIC_MUTRATE:.3f}  |  policy: {GA_INDIV_MUT_POLICY}")
+        print(f"           µ_pop(t) = {GA_DYNAMIC_MUTRATE:.3f}  |  μ‑policy: {GA_INDIV_MUT_POLICY}")
         if GEN_AVG_INDIV_MUT_HISTORY:
             print(f"           µ_indiv_avg(t) = {GEN_AVG_INDIV_MUT_HISTORY[-1]:.3f}")
+        if GEN_AVG_G_HISTORY:
+            print(f"           ⟨g(x,t)⟩ = {GEN_AVG_G_HISTORY[-1]:.3f}  |  g‑policy: {GA_ADAPT_FIT_POLICY}")
         mutation_rate_history.append(GA_DYNAMIC_MUTRATE)
 
         # --- update mutation probability for this generation ---
@@ -985,6 +1159,12 @@ def run_dtsp(cities_path: str):
         plt.legend()
         plt.tight_layout()
         plt.show()
+    if GEN_AVG_G_HISTORY:
+        plt.figure(figsize=(10,4))
+        plt.plot(GEN_AVG_G_HISTORY, label="⟨g(x,t)⟩")
+        plt.xlabel("generation"); plt.ylabel("auxiliary reward g(x,t)")
+        plt.title(f"{GA_ADAPT_FIT_POLICY} reward per generation")
+        plt.grid(True); plt.legend(); plt.tight_layout(); plt.show()
     if mutation_rate_history and GEN_AVG_INDIV_MUT_HISTORY:
         plt.figure(figsize=(10, 4))
         plt.plot(mutation_rate_history, label="population µ_pop(t)")
@@ -1039,6 +1219,7 @@ def run_dtsp(cities_path: str):
 def main():
     global GA_MODE, GA_ARC_TARGET_GRID, GA_ARC_INPUT_GRID, bp_instance
     global GA_FITNESS_HEURISTIC, GA_CROSSOVER_OPERATOR
+    global CURRENT_GENERATION
 
     print("Select mode:")
     print("1 - String evolution")
@@ -1060,6 +1241,21 @@ def main():
     else:
         GA_INDIV_MUT_POLICY = "NONE"
     print(f"➜  Individual mutation policy set to {GA_INDIV_MUT_POLICY}")
+
+    # ─── choose adaptive *fitness* augmentation policy (Task 2‑c) ───
+    print("\nSelect adaptive fitness augmentation:")
+    print("0 - NONE (raw problem fitness only)")
+    print("1 - AGE reward  (fitness += age)")
+    print("2 - NOVELTY reward (fitness -= novelty)")
+    pol_fit = input("Enter choice (0/1/2) [default 0]: ").strip()
+    global GA_ADAPT_FIT_POLICY
+    if pol_fit == "1":
+        GA_ADAPT_FIT_POLICY = "AGE"
+    elif pol_fit == "2":
+        GA_ADAPT_FIT_POLICY = "NOVELTY"
+    else:
+        GA_ADAPT_FIT_POLICY = "NONE"
+    print(f"➜  Adaptive fitness policy set to {GA_ADAPT_FIT_POLICY}")
     
     if mode_choice == "2":
         GA_MODE = "ARC"
@@ -1150,12 +1346,19 @@ def main():
                 start_time = timeit.default_timer()
                 #consecutive_ones = 0  # Count consecutive generations with best fitness equal to 1
                 GEN_AVG_INDIV_MUT_HISTORY.clear()
+                GEN_AVG_G_HISTORY.clear()
                 for generation in range(50):
+                    CURRENT_GENERATION = generation  # keep global counter in sync
                     tick_start = timeit.default_timer()
                     # compute µ(t) for current generation
                     GA_DYNAMIC_MUTRATE = compute_mutation_rate(generation, no_improve_count)
                     for ind in population:
                         ind.calculate_fitness_binpacking()
+
+                    # --- adaptive fitness augmentation (AGE / NOVELTY / NONE) ---
+                    apply_adaptive_fitness(population)
+
+                    # re‑sort after fitness tweak
                     sort_population(population)
                     best_fitness = population[0].fitness
                     # ── global‑best bookkeeping & patience counter ─────────────────────
@@ -1233,6 +1436,30 @@ def main():
                     plt.legend()
                     plt.tight_layout()
                     plt.show()
+
+                # ----- Convergence curves (fitness & auxiliary reward) -----
+                if best_fitness_list:
+                    plt.figure(figsize=(10, 4))
+                    plt.plot(best_fitness_list, label="best fitness")
+                    plt.xlabel("generation")
+                    plt.ylabel("fitness (bins – optimal)")
+                    plt.title("Bin Packing – best fitness per generation")
+                    plt.grid(True)
+                    plt.legend()
+                    plt.tight_layout()
+                    plt.show()
+
+                if GEN_AVG_G_HISTORY:
+                    plt.figure(figsize=(10, 4))
+                    plt.plot(GEN_AVG_G_HISTORY, label="⟨g(x,t)⟩")
+                    plt.xlabel("generation")
+                    plt.ylabel("auxiliary reward g(x,t)")
+                    plt.title(f"{GA_ADAPT_FIT_POLICY} reward per generation")
+                    plt.grid(True)
+                    plt.legend()
+                    plt.tight_layout()
+                    plt.show()
+
             exit(0)
         except Exception as e:
             print("Error loading bin packing file:", e)
@@ -1343,6 +1570,7 @@ def main():
     best_ever = None                 # stores the chromosome / path pair
     best_ever_fitness = float('inf') # minimization: lower is better
     while generation < GA_MAXITER:
+        CURRENT_GENERATION = generation
         tick_start = timeit.default_timer()
         for ind in population:
             if GA_MODE == "DTSP":
@@ -1351,6 +1579,8 @@ def main():
                 ind.calculate_fitness()
             else:
                 ind.calculate_fitness_lcs()
+        CURRENT_GENERATION = 0
+        apply_adaptive_fitness(population)      # NEW
         sort_population(population)
         fitness_values = [ind.fitness for ind in population]
         fitness_distributions.append(fitness_values.copy())
@@ -1387,6 +1617,11 @@ def main():
         tick_duration = tick_end - tick_start
         total_elapsed = tick_end - start_time
         print(f"Gen {generation}: Best‑so‑far = {best_ever.repr if hasattr(best_ever, 'repr') else best_ever} (Fitness = {best_ever_fitness})")
+        print(f"           µ_pop(t) = {GA_DYNAMIC_MUTRATE:.3f}  |  μ‑policy: {GA_INDIV_MUT_POLICY}")
+        if GEN_AVG_INDIV_MUT_HISTORY:
+            print(f"           µ_indiv_avg(t) = {GEN_AVG_INDIV_MUT_HISTORY[-1]:.3f}")
+        if GEN_AVG_G_HISTORY:
+            print(f"           ⟨g(x,t)⟩ = {GEN_AVG_G_HISTORY[-1]:.3f}  |  g‑policy: {GA_ADAPT_FIT_POLICY}")
         if population[0].fitness == 0:
             best_solution = population[0].repr
             print(f"\n*** Converged after {generation + 1} generations ***")
@@ -1436,6 +1671,12 @@ def main():
         plt.legend()
         plt.tight_layout()
         plt.show()
+    if GEN_AVG_G_HISTORY:
+        plt.figure(figsize=(10,4))
+        plt.plot(GEN_AVG_G_HISTORY, label="⟨g(x,t)⟩")
+        plt.xlabel("generation"); plt.ylabel("auxiliary reward g(x,t)")
+        plt.title(f"{GA_ADAPT_FIT_POLICY} reward per generation")
+        plt.grid(True); plt.legend(); plt.tight_layout(); plt.show()
         plt.figure(figsize=(10, 4))
         plt.plot(best_fitness_list, label="Best fitness")
         plt.xlabel("generation")
