@@ -130,6 +130,49 @@ def _dist(a: int, b: int) -> float:
     _DISTANCE_CACHE[key] = d
     return d
 
+# ───────── Gene‑Distance metrics  (Task 3) ───────── #
+
+_MAX_CITY_DIST = None  # DTSP – calculated lazily once
+
+def gene_distance_dtsp(city_a: int, city_b: int) -> float:
+    """
+    Gene distance for DTSP.
+    A gene ≡ city index; distance is the normalised Euclidean distance
+    between the two cities in [0,1].
+
+        0.0 → identical city
+        1.0 → farthest‑apart pair of cities in this instance
+    """
+    if city_a == city_b:
+        return 0.0
+    global _MAX_CITY_DIST
+    if _MAX_CITY_DIST is None:
+        n = len(DTSP_CITIES)
+        _MAX_CITY_DIST = max(
+            _dist(i, j) for i in range(n) for j in range(i + 1, n)
+        )
+    # fall back to 1 to avoid division‑by‑zero on degenerate instances
+    denom = _MAX_CITY_DIST or 1.0
+    return _dist(city_a, city_b) / denom
+
+
+def gene_distance_binpack(item_i: int, item_j: int) -> float:
+    """
+    Gene distance for Bin‑Packing.
+    A gene ≡ item index; distance is the absolute size difference
+    normalised by the bin capacity (range [0,1]).
+
+        0.0 → items of identical size
+        1.0 → maximal possible difference (== BP_CAPACITY)
+    """
+    if item_i == item_j:
+        return 0.0
+    # If BP_CAPACITY is not yet initialised, protect against ZeroDivision
+    denom = float(BP_CAPACITY or 1)
+    return abs(BP_ITEMS[item_i] - BP_ITEMS[item_j]) / denom
+
+# ─────────────────────────────────────────────────── #
+
 # ───────── dynamic mutation‑rate scheduler ────────────────────────── #
 def compute_mutation_rate(generation: int, stagnation_counter: int) -> float:
     """
