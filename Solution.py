@@ -3,6 +3,7 @@ import time
 import timeit
 import statistics
 import matplotlib.pyplot as plt
+SHOW_PLOTS = False   # Global flag – set True to enable any plotting
 import math  # Required for entropy calculations
 import json
 import numpy as np
@@ -14,7 +15,7 @@ from pathlib import Path  # needed for TSPLIB loader
 from functools import lru_cache
 
 # Global GA parameters
-GA_POPSIZE = 512    # Population size for the genetic algorithm
+GA_POPSIZE = 300    # Population size for the genetic algorithm
 GA_MAXITER = 16384    # Maximum number of generations (used in non-Bin Packing modes)
 # Stop if the global best fitness hasn't improved for this many generations
 GA_NO_IMPROVEMENT_LIMIT = 300
@@ -25,13 +26,13 @@ GA_MUTATIONRATE = 0.25            # Mutation probability
 GA_MUTATION_POLICY  = "CONSTANT"   # "CONSTANT", "LOGISTIC", "THM"
 # LOGISTIC‑decay parameters
 GA_MUTRATE_MAX      = 0.9
-GA_MUTRATE_MIN      = 0.05
-GA_DECAY_RATE       = 0.05         # decay coefficient r
+GA_MUTRATE_MIN      = 0.1
+GA_DECAY_RATE       = 0.01         # decay coefficient r
 # Triggered‑Hyper‑Mutation (THM) parameters
 GA_MUTRATE_BASE     = 0.25
-GA_MUTRATE_HYPER    = 0.75
-GA_THM_PATIENCE     = 25           # gens without improvement ⇒ burst
-GA_THM_DURATION     = 20            # gens to keep hyper‑µ active
+GA_MUTRATE_HYPER    = 0.9
+GA_THM_PATIENCE     = 20           # gens without improvement ⇒ burst
+GA_THM_DURATION     = 40            # gens to keep hyper‑µ active
 # runtime variables (updated each generation)
 GA_DYNAMIC_MUTRATE  = GA_MUTATIONRATE   # effective µ for the current gen
 _THM_BURST_REMAINING = 0
@@ -55,8 +56,8 @@ _INDIV_MUT_MAX      = GA_MUTRATE_MAX
 #          "NOVELTY" (k‑NN behavioural‑novelty reward)
 GA_ADAPT_FIT_POLICY = "NONE"
 AGE_WEIGHT          = 1.0       # fitness += AGE_WEIGHT * age
-NOVELTY_K           = 5         # number of neighbours for novelty
-NOVELTY_WEIGHT      = 1.0       # fitness -= NOVELTY_WEIGHT * novelty
+NOVELTY_K           = 3         # number of neighbours for novelty
+NOVELTY_WEIGHT      = 10       # fitness -= NOVELTY_WEIGHT * novelty
 GEN_AVG_G_HISTORY: list[float] = []   # log ⟨g(x,t)⟩ per generation
 
 # ───── Niching / Speciation (Task 4) ───── #
@@ -243,6 +244,8 @@ def plot_dtsp_paths(path_pair, title="DTSP – two disjoint tours"):
     מצייר את שני המסלולים על גרף פיזור.
     כחול – מסלול 1, כתום – מסלול 2.
     """
+    if not SHOW_PLOTS:
+        return
     if not DTSP_CITIES:
         print("No cities loaded – cannot plot")
         return
@@ -343,11 +346,16 @@ class GAIndividual:
             return perm
 
     def random_dtsp(self):
-        """מייצר שני מסלולים אקראיים כתמורות של הערים"""
+        """
+        Generate two completely random tours over all cities.
+        The two tours are sampled independently, therefore edge
+        overlaps between them **are allowed** at this stage.
+        """
+        # two *independent* random tours
         cities = list(range(len(DTSP_CITIES)))
-        p1 = random.sample(cities, len(cities))
-        p2 = random.sample(cities, len(cities))
-        return (p1, p2)
+        path1 = random.sample(cities, len(cities))   # completely random permutation
+        path2 = random.sample(cities, len(cities))   # another independent permutation
+        return (path1, path2)
 
     def mutate_grid(self, grid):
         """Randomly mutate the grid by changing one random cell's value."""
@@ -510,16 +518,27 @@ class GAIndividual:
 
     def repair_dtsp(self):
         """
-        Break edge overlaps between the two tours using 2‑opt style segment reversals.
+        Aggressively break *all* edge overlaps between the two tours.
+        Repeats up to 50 attempts, each time locating the current set
+        of overlapping edges and applying a 2‑opt‑style segment reversal
+        to one of the tours until **no** common edges remain or the safety
+        limit is reached.
         """
         path1, path2 = self.repr
-        edges1 = self._get_edges(path1)
-        edges2 = self._get_edges(path2)
+        max_attempts = 50
+        attempts = 0
 
-        common_edges = set(edges1).intersection(edges2)
-        for (a, b) in list(common_edges):
-            # helper: find index of edge (x,y) or (y,x) in path
-            def edge_index(p, x, y):
+        while tours_edge_overlap(path1, path2) and attempts < max_attempts:
+            edges1 = self._get_edges(path1)
+            edges2 = self._get_edges(path2)
+            common_edges = list(set(edges1).intersection(edges2))
+            if not common_edges:
+                break  # overlap already resolved
+            # pick one offending edge at random and flip a segment that contains it
+            a, b = random.choice(common_edges)
+
+            # helper: find index of edge (x,y) or (y,x) in a path
+            def _edge_index(p, x, y):
                 try:
                     i = p.index(x)
                     if p[(i + 1) % len(p)] == y:
@@ -530,24 +549,48 @@ class GAIndividual:
                 except ValueError:
                     return None
                 return None
-            idx1 = edge_index(path1, a, b)
-            idx2 = edge_index(path2, a, b)
-            if idx1 is None or idx2 is None:
-                continue
-            # choose which path to modify
+
+            # decide which tour to modify this round
             if random.random() < 0.5:
-                i, j = sorted((idx1, (idx1 + 1) % len(path1)))
-                path1[i:j + 1] = reversed(path1[i:j + 1])
+                idx = _edge_index(path1, a, b)
+                if idx is not None:
+                    i, j = sorted((idx, (idx + 1) % len(path1)))
+                    path1[i:j + 1] = reversed(path1[i:j + 1])
             else:
-                i, j = sorted((idx2, (idx2 + 1) % len(path2)))
-                path2[i:j + 1] = reversed(path2[i:j + 1])
+                idx = _edge_index(path2, a, b)
+                if idx is not None:
+                    i, j = sorted((idx, (idx + 1) % len(path2)))
+                    path2[i:j + 1] = reversed(path2[i:j + 1])
+
+            attempts += 1
+
+        # invalidate cached union so novelty / fitness reflect the update
         self._edge_union = None
     
     def local_optimize_dtsp(self):
-        """Apply 2-opt independently to both tours (Step F)."""
+        """
+        Apply 2‑opt independently to both tours (Step F) **and immediately
+        repair any edge overlaps** that this local optimisation might introduce.
+        This prevents the periodic fitness spikes observed every 50 generations.
+        """
         p1, p2 = self.repr
+
+        # --- run independent 2‑opt on each tour -----------------
         two_opt(p1)
         two_opt(p2)
+
+        # --- iterative repair to guarantee *full* edge disjointness ----
+        # The simple one‑shot repair sometimes leaves residual overlaps
+        # and causes the enormous fitness spikes seen every 50 generations.
+        # We therefore loop until no overlap remains (or a small cap
+        # is reached to avoid infinite loops on pathological cases).
+        max_attempts = 30
+        attempts = 0
+        while tours_edge_overlap(p1, p2) and attempts < max_attempts:
+            self.repair_dtsp()
+            attempts += 1
+
+        # invalidate cached union so novelty / fitness reflect the update
         self._edge_union = None
 
 def init_population():
@@ -1155,7 +1198,7 @@ def run_dtsp(cities_path: str):
     """
     global CURRENT_GENERATION
     # --- user‑tunable patience: stop after this many generations w/o progress
-    EARLY_STOP_PATIENCE = 100        # ← was effectively 300 before
+    EARLY_STOP_PATIENCE = 200        # ← was effectively 300 before
     global GA_MODE, GA_CROSSOVER_OPERATOR, GA_FITNESS_HEURISTIC
 
     # ---------- Step B: draw a random initial pair of tours -------------
@@ -1192,8 +1235,8 @@ def run_dtsp(cities_path: str):
     # ---------- Step E + F + G: evolutionary loop -----------------------
     for generation in range(GA_MAXITER):
         CURRENT_GENERATION = generation
-        # Step F – local 2‑opt every 50 generations
-        if generation and generation % 50 == 0:
+        # Step F – local 2‑opt every 25 generations
+        if generation and generation % 25 == 0:
             for ind in population:
                 ind.local_optimize_dtsp()
 
@@ -1232,12 +1275,6 @@ def run_dtsp(cities_path: str):
         # --- update mutation probability for this generation ---
         GA_DYNAMIC_MUTRATE = compute_mutation_rate(generation, no_improve_count)
 
-        # Legacy hyper‑mutation (only when mutation policy is CONSTANT)
-        if (GA_MUTATION_POLICY.upper() == "CONSTANT"
-                and no_improve_count and no_improve_count % 100 == 0):
-            print('🧬  Legacy hyper‑mutation triggered!')
-            for ind in population[int(0.5 * GA_POPSIZE):]:
-                ind.mutate_dtsp()   # high‑intensity mutation
 
         if no_improve_count >= EARLY_STOP_PATIENCE:
             print(f"⏹  Early‑stop: no improvement for {EARLY_STOP_PATIENCE} generations")
@@ -1250,46 +1287,47 @@ def run_dtsp(cities_path: str):
         population = apply_aging(population)
 
     # ---------- Step H: convergence plots -------------------------------
-    try:
-        import matplotlib.pyplot as plt
-        plt.figure(figsize=(10, 6))
-        plt.plot(fitness_history, label="best")
-        plt.plot(avg_history, label="avg")
-        plt.plot(worst_history, label="worst")
-        plt.xlabel("generation"); plt.ylabel("fitness")
-        plt.title("DTSP convergence"); plt.legend(); plt.grid(True)
-        plt.tight_layout(); plt.show()
-    except Exception as e:
-        print(f"Plotting failed: {e}")
+    if SHOW_PLOTS:
+        try:
+            import matplotlib.pyplot as plt
+            plt.figure(figsize=(10, 6))
+            plt.plot(fitness_history, label="best")
+            plt.plot(avg_history, label="avg")
+            plt.plot(worst_history, label="worst")
+            plt.xlabel("generation"); plt.ylabel("fitness")
+            plt.title("DTSP convergence"); plt.legend(); plt.grid(True)
+            plt.tight_layout(); plt.show()
+        except Exception as e:
+            print(f"Plotting failed: {e}")
 
-    # ---------- µ(t) plot -------------------------------------------------
-    if mutation_rate_history:
-        plt.figure(figsize=(10, 4))
-        plt.plot(mutation_rate_history, label="µ(t)")
-        plt.xlabel("generation")
-        plt.ylabel("mutation rate")
-        plt.title("Mutation rate per generation")
-        plt.grid(True)
-        plt.legend()
-        plt.tight_layout()
-        plt.show()
-    if GEN_AVG_G_HISTORY:
-        plt.figure(figsize=(10,4))
-        plt.plot(GEN_AVG_G_HISTORY, label="⟨g(x,t)⟩")
-        plt.xlabel("generation"); plt.ylabel("auxiliary reward g(x,t)")
-        plt.title(f"{GA_ADAPT_FIT_POLICY} reward per generation")
-        plt.grid(True); plt.legend(); plt.tight_layout(); plt.show()
-    if mutation_rate_history and GEN_AVG_INDIV_MUT_HISTORY:
-        plt.figure(figsize=(10, 4))
-        plt.plot(mutation_rate_history, label="population µ_pop(t)")
-        plt.plot(GEN_AVG_INDIV_MUT_HISTORY, label="avg individual µ_indiv(t)")
-        plt.xlabel("generation")
-        plt.ylabel("mutation rate")
-        plt.title("Population vs Individual mutation rate")
-        plt.grid(True)
-        plt.legend()
-        plt.tight_layout()
-        plt.show()
+        # ---------- µ(t) plot -------------------------------------------------
+        if mutation_rate_history:
+            plt.figure(figsize=(10, 4))
+            plt.plot(mutation_rate_history, label="µ(t)")
+            plt.xlabel("generation")
+            plt.ylabel("mutation rate")
+            plt.title("Mutation rate per generation")
+            plt.grid(True)
+            plt.legend()
+            plt.tight_layout()
+            plt.show()
+        if GEN_AVG_G_HISTORY:
+            plt.figure(figsize=(10,4))
+            plt.plot(GEN_AVG_G_HISTORY, label="⟨g(x,t)⟩")
+            plt.xlabel("generation"); plt.ylabel("auxiliary reward g(x,t)")
+            plt.title(f"{GA_ADAPT_FIT_POLICY} reward per generation")
+            plt.grid(True); plt.legend(); plt.tight_layout(); plt.show()
+        if mutation_rate_history and GEN_AVG_INDIV_MUT_HISTORY:
+            plt.figure(figsize=(10, 4))
+            plt.plot(mutation_rate_history, label="population µ_pop(t)")
+            plt.plot(GEN_AVG_INDIV_MUT_HISTORY, label="avg individual µ_indiv(t)")
+            plt.xlabel("generation")
+            plt.ylabel("mutation rate")
+            plt.title("Population vs Individual mutation rate")
+            plt.grid(True)
+            plt.legend()
+            plt.tight_layout()
+            plt.show()
 
     # ---------- Step I: visualise best paths ----------------------------
     # ===== Ensure best solution is disjoint; attempt final repair =====
@@ -1480,34 +1518,7 @@ def main():
     print("5 - Baldwin Effect experiment")
     mode_choice = input("Enter your choice (1/2/3/4/5): ").strip()
     
-    # ─── choose individual‑level adaptive mutation policy ───
-    print("\nSelect individual adaptive mutation policy:")
-    print("0 - NONE (population‑wide only)")
-    print("1 - RELATIVE FITNESS‑based")
-    print("2 - AGE‑based")
-    pol = input("Enter choice (0/1/2) [default 0]: ").strip()
-    if pol == "1":
-        GA_INDIV_MUT_POLICY = "FITNESS"
-    elif pol == "2":
-        GA_INDIV_MUT_POLICY = "AGE"
-    else:
-        GA_INDIV_MUT_POLICY = "NONE"
-    print(f"➜  Individual mutation policy set to {GA_INDIV_MUT_POLICY}")
-
-    # ─── choose adaptive *fitness* augmentation policy (Task 2‑c) ───
-    print("\nSelect adaptive fitness augmentation:")
-    print("0 - NONE (raw problem fitness only)")
-    print("1 - AGE reward  (fitness += age)")
-    print("2 - NOVELTY reward (fitness -= novelty)")
-    pol_fit = input("Enter choice (0/1/2) [default 0]: ").strip()
-    global GA_ADAPT_FIT_POLICY
-    if pol_fit == "1":
-        GA_ADAPT_FIT_POLICY = "AGE"
-    elif pol_fit == "2":
-        GA_ADAPT_FIT_POLICY = "NOVELTY"
-    else:
-        GA_ADAPT_FIT_POLICY = "NONE"
-    print(f"➜  Adaptive fitness policy set to {GA_ADAPT_FIT_POLICY}")
+    # Mutation and adaptive‑fitness policies are set directly in code – no interactive prompt.
     
     if mode_choice == "2":
         GA_MODE = "ARC"
@@ -1667,7 +1678,7 @@ def main():
                     total = sum(sizes)
                     print(f"Bin {idx}: {sizes}  (Total: {total}/{BP_CAPACITY})")
                 # ---- plot µ(t) curve for this Bin‑Packing run ----
-                if mutation_rate_history:
+                if SHOW_PLOTS and mutation_rate_history:
                     plt.figure(figsize=(10, 4))
                     plt.plot(mutation_rate_history, label="µ(t)")
                     plt.xlabel("generation")
@@ -1677,7 +1688,7 @@ def main():
                     plt.legend()
                     plt.tight_layout()
                     plt.show()
-                if mutation_rate_history and GEN_AVG_INDIV_MUT_HISTORY:
+                if SHOW_PLOTS and mutation_rate_history and GEN_AVG_INDIV_MUT_HISTORY:
                     plt.figure(figsize=(10, 4))
                     plt.plot(mutation_rate_history, label="population µ_pop(t)")
                     plt.plot(GEN_AVG_INDIV_MUT_HISTORY, label="avg individual µ_indiv(t)")
@@ -1690,7 +1701,7 @@ def main():
                     plt.show()
 
                 # ----- Convergence curves (fitness & auxiliary reward) -----
-                if best_fitness_list:
+                if SHOW_PLOTS and best_fitness_list:
                     plt.figure(figsize=(10, 4))
                     plt.plot(best_fitness_list, label="best fitness")
                     plt.xlabel("generation")
@@ -1701,7 +1712,7 @@ def main():
                     plt.tight_layout()
                     plt.show()
 
-                if GEN_AVG_G_HISTORY:
+                if SHOW_PLOTS and GEN_AVG_G_HISTORY:
                     plt.figure(figsize=(10, 4))
                     plt.plot(GEN_AVG_G_HISTORY, label="⟨g(x,t)⟩")
                     plt.xlabel("generation")
